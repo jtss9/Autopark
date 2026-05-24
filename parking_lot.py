@@ -81,7 +81,7 @@ class ParkingLot:
         spot_x = (lane_len - pc.spot_width) / 2
         self.spot_rect = Rect(spot_x, pc.lane_width, pc.spot_width, pc.spot_length)
 
-        # Car starts to the left of the spot centre, parallel to road
+        # Car starts to the left of the spot centre, in the lane centre.
         self.car_start_pose: Tuple[float, float, float] = (
             spot_x / 2,
             pc.lane_width / 2,

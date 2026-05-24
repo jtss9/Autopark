@@ -19,7 +19,7 @@ COLOR_BG        = "#f5f5f5"
 
 # (display label, var attribute name, slider min, slider max, default)
 SLIDER_DEFS = [
-    ("Lane Width (m)",  "var_lane_w",   3.0, 5.0,  4.0),
+    ("Lane Width (m)",  "var_lane_w",   3.5, 5.5,  4.0),
     ("Spot Length (m)", "var_spot_len", 5.0, 6.0,  5.5),
     ("Spot Width (m)",  "var_spot_w",   2.0, 3.0,  2.5),
     ("Car Length (m)",  "var_car_len",  3.5, 5.0,  4.2),
@@ -28,8 +28,13 @@ SLIDER_DEFS = [
 
 
 class SettingsWindow:
-    def __init__(self):
+    def __init__(self,
+                 initial_parking: Optional[ParkingConfig] = None,
+                 initial_car:     Optional[CarConfig]     = None):
         self.result: Optional[Tuple[ParkingConfig, CarConfig]] = None
+        self._initial_parking = initial_parking
+        self._initial_car     = initial_car
+
         self.root = tk.Tk()
         self.root.title("Smart Parking Simulator - Settings")
         self.root.configure(bg=COLOR_BG)
@@ -46,12 +51,15 @@ class SettingsWindow:
     # Variables
     # ------------------------------------------------------------------
     def _init_vars(self):
-        self.var_lane_w   = tk.DoubleVar(value=4.0)
-        self.var_spot_len = tk.DoubleVar(value=5.5)
-        self.var_spot_w   = tk.DoubleVar(value=2.5)
-        self.var_car_len  = tk.DoubleVar(value=4.2)
-        self.var_car_w    = tk.DoubleVar(value=1.8)
-        self.var_type     = tk.StringVar(value="perpendicular")
+        pc = self._initial_parking
+        cc = self._initial_car
+
+        self.var_lane_w   = tk.DoubleVar(value=pc.lane_width   if pc else 4.0)
+        self.var_spot_len = tk.DoubleVar(value=pc.spot_length  if pc else 5.5)
+        self.var_spot_w   = tk.DoubleVar(value=pc.spot_width   if pc else 2.5)
+        self.var_car_len  = tk.DoubleVar(value=cc.length       if cc else 4.2)
+        self.var_car_w    = tk.DoubleVar(value=cc.width        if cc else 1.8)
+        self.var_type     = tk.StringVar(value=pc.parking_type if pc else "perpendicular")
 
         for *_, attr, _min, _max, _def in SLIDER_DEFS:
             getattr(self, attr).trace_add("write", self._on_change)

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"C:\\\\Users\\\\User\\\\anaconda3\\\\envs\\\\car\\\\python.exe\" -c \"import pygame, PIL; print\\('pygame', pygame.version.ver\\); print\\('Pillow', PIL.__version__\\)\")"
+    ]
+  }
+}

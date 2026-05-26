@@ -35,6 +35,8 @@ class TrajectoryResult:
 
 def plan_trajectory(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResult:
     if pc.parking_type == "perpendicular":
+        if pc.planner == "multi":
+            return _plan_perpendicular_multistep(pc, cc)
         return _plan_perpendicular_mpc(pc, cc)
     return TrajectoryResult([], False, "Parallel parking not yet implemented.")
 
@@ -193,3 +195,177 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
     elapsed = time.perf_counter() - t0
     print(f" done in {elapsed:.1f}s ({len(wps)} waypoints)")
     return TrajectoryResult(wps, True, "OK", phase_starts, phase_names)
+
+
+# ---------------------------------------------------------------------------
+# Multi-step planner — state machine + goal-directed NMPC
+# ---------------------------------------------------------------------------
+def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResult:
+    """
+    Multi-step planner.  Each reverse attempt uses a fresh geometric arc
+    reference computed from the current (elevated) car position, tracked by the
+    same reference-MPC as the single-step planner.  When the warn margin fires,
+    a goal-directed correction drives the car back to x_stop while HOLDING the
+    y-elevation gained — so each attempt starts higher and sweeps with more
+    front-corner clearance.
+    """
+    from controller import CarDynamics, MPCController
+
+    lot    = ParkingLot(pc, cc)
+    x_spot = lot.spot_rect.x + lot.spot_rect.w / 2
+    x_stop = min(x_spot + cc.min_turn_radius, lot.lane_rect.right - 0.15)
+
+    FORWARD_V    = 3.0
+    REVERSE_V    = 1.5
+    MAX_ATTEMPTS = 5
+    WARN_MARGIN  = 0.15   # triggers correction when any corner within this of road bottom
+    dt           = 0.05
+
+    # Build a fresh geometric arc reference from (x0, y0, theta0).
+    # Generates the remaining arc needed to reach theta=-pi/2, so each
+    # attempt continues from the car's actual heading rather than assuming 0.
+    def _arc_ref(x0: float, y0: float, theta0: float = 0.0) -> List[Waypoint]:
+        R    = cc.min_turn_radius
+        STEP = 0.05
+        # ICR for a left-turn reverse maneuver starting at theta0
+        icr_x = x0 - R * math.sin(theta0)
+        icr_y = y0 + R * math.cos(theta0)
+        # Sweep from theta0 to -pi/2
+        arc_span = theta0 + math.pi / 2          # always > 0 for theta0 > -pi/2
+        n_arc = max(2, int(math.degrees(arc_span)) + 1)
+        ref: List[Waypoint] = []
+        for i in range(n_arc):
+            t  = arc_span * i / (n_arc - 1)
+            th = theta0 - t
+            ref.append(Waypoint(icr_x + R * math.sin(th),
+                                icr_y - R * math.cos(th), th))
+        x_end = icr_x - R            # x at theta=-pi/2
+        y_end = icr_y                # y at theta=-pi/2
+        y = y_end + STEP
+        spot_top = lot.lane_rect.top + lot.spot_rect.h
+        target_y = min(spot_top - 0.15, y_end + 1.5)
+        while y < target_y - STEP / 2:
+            ref.append(Waypoint(x_end, y, -math.pi / 2))
+            y += STEP
+        ref.append(Waypoint(x_end, target_y, -math.pi / 2))
+        return ref
+
+    car = CarDynamics(*lot.car_start_pose, cc)
+    bounds_mpc = MPCController(lot, cc, [])   # used only for boundary checks
+
+    wps:          List[Waypoint] = [Waypoint(car.x, car.y, car.theta)]
+    phase_starts: List[int]      = [0]
+    phase_names:  List[str]      = ["Drive forward"]
+
+    t0 = time.perf_counter()
+    print("Planning multi-step MPC trajectory...", end="", flush=True)
+
+    # ── Phase 1: straight forward to x_stop ───────────────────────────────────
+    while car.x < x_stop - 0.05:
+        car.step(FORWARD_V, 0.0, dt)
+        wps.append(Waypoint(car.x, car.y, car.theta))
+        if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
+            print(f" failed ({time.perf_counter() - t0:.1f}s)")
+            return TrajectoryResult(
+                wps, False, "Car body exceeded valid area during forward drive.",
+                phase_starts, phase_names)
+
+    # ── Phase 2+: alternating REVERSING / FORWARD_CORRECT ─────────────────────
+    prev_delta = 0.0
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        # Fresh arc reference continuing from the car's current heading
+        ref_wps  = _arc_ref(car.x, car.y, car.theta)
+        rev_mpc  = MPCController(lot, cc, ref_wps)
+        rev_mpc.ref_idx = 0
+        goal     = ref_wps[-1]
+
+        phase_starts.append(len(wps))
+        phase_names.append(f"Reversing (attempt {attempt})")
+
+        near_boundary = False
+        for _ in range(1500):
+            delta = rev_mpc.optimize(car, -REVERSE_V, prev_delta)
+            car.step(-REVERSE_V, delta, dt)
+            prev_delta = delta
+
+            if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
+                wps.append(Waypoint(car.x, car.y, car.theta))
+                print(f" failed ({time.perf_counter() - t0:.1f}s)")
+                return TrajectoryResult(
+                    wps, False,
+                    "Car body exceeded valid area — try a wider lane or shorter car.",
+                    phase_starts, phase_names)
+
+            wps.append(Waypoint(car.x, car.y, car.theta))
+
+            dist = math.hypot(car.x - goal.x, car.y - goal.y)
+            dh   = abs((car.theta - goal.theta + math.pi) % (2 * math.pi) - math.pi)
+            if dist < 0.15 and dh < 0.1:
+                elapsed = time.perf_counter() - t0
+                print(f" done in {elapsed:.1f}s ({len(wps)} waypoints, "
+                      f"{attempt} attempt(s))")
+                return TrajectoryResult(wps, True, "OK", phase_starts, phase_names)
+
+            # Only trigger correction for road-bottom approach — the MPC
+            # boundary penalty handles spot/side boundaries.
+            corners = lot.car_corners((car.x, car.y, car.theta))
+            if any(cy < lot.lane_rect.y + WARN_MARGIN for _, cy in corners):
+                near_boundary = True
+                break
+
+        if not near_boundary or attempt == MAX_ATTEMPTS:
+            break
+
+        # ── Correction (2-phase) ──────────────────────────────────────────────
+        # Phase A: reverse with hard RIGHT steer until theta ≈ 0°.
+        #   dy/dt = v·sin(theta) = (−v)·sin(negative θ) > 0  → gains y clearance.
+        # Phase B: drive FORWARD straight (delta=0) back to x_stop.
+        #   At theta ≈ 0°, sin(theta) ≈ 0  → y stays constant while x is restored.
+        phase_starts.append(len(wps))
+        phase_names.append(f"Forward correction {attempt}")
+
+        # Phase A
+        for _ in range(100):
+            car.step(-REVERSE_V, -cc.max_steer, dt)
+            prev_delta = -cc.max_steer
+            wps.append(Waypoint(car.x, car.y, car.theta))
+            if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
+                print(f" failed ({time.perf_counter() - t0:.1f}s)")
+                return TrajectoryResult(
+                    wps, False, "Car body exceeded valid area during correction.",
+                    phase_starts, phase_names)
+            if abs(car.theta) < math.radians(5):
+                break
+
+        # Phase B — drive forward to an x position safe for the next arc.
+        # With elevated y, going all the way to x_stop would cause the car
+        # body to clip the spot's right boundary when entering.  Compute the
+        # maximum safe x_start so the body stays within spot.right + margin.
+        R_turn   = cc.min_turn_radius
+        half_w   = cc.width / 2
+        denom    = R_turn - half_w                     # (R - W/2)
+        icr_diff = car.y + R_turn - lot.lane_rect.top  # ICR_y - lane_top
+        if 0 < icr_diff < denom:
+            sin_tc   = math.sqrt(max(0.0, 1.0 - (icr_diff / denom) ** 2))
+            x_target = min(x_stop, lot.spot_rect.right + 0.05 + denom * sin_tc - 0.10)
+        else:
+            x_target = x_stop
+        x_target = max(x_target, car.x + 0.30)        # always drive at least 30 cm
+
+        for _ in range(300):
+            car.step(FORWARD_V, 0.0, dt)
+            prev_delta = 0.0
+            wps.append(Waypoint(car.x, car.y, car.theta))
+            if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
+                print(f" failed ({time.perf_counter() - t0:.1f}s)")
+                return TrajectoryResult(
+                    wps, False, "Car body exceeded valid area during correction.",
+                    phase_starts, phase_names)
+            if car.x >= x_target - 0.05:
+                break
+
+    print(f" timed out ({time.perf_counter() - t0:.1f}s)")
+    return TrajectoryResult(
+        wps, False,
+        f"Could not park within {MAX_ATTEMPTS} attempts.",
+        phase_starts, phase_names)

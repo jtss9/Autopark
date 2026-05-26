@@ -49,6 +49,10 @@ Adjust all parameters using the sliders on the left. The preview canvas on the r
 - **Reverse into Spot (倒車入庫)** — car starts parallel to the road and reverses perpendicularly into the spot
 - **Parallel Parking (路邊停車)** — not yet implemented
 
+**Planner**
+- **Single-step MPC** — tracks a pre-computed geometric arc; succeeds in wider lanes, fails with COLLISION in narrow ones
+- **Multi-step MPC** — uses alternating reverse/correction attempts; extends the feasibility boundary into narrower lanes where single-step fails
+
 If the car is too large for the spot, the spot outline turns red and simulation is blocked until dimensions are corrected.
 
 Click **Start Simulation** to proceed.
@@ -97,10 +101,25 @@ The reference point for all waypoints and car corner calculations is the **rear 
 
 ## Trajectory Planning
 
-Parking uses a two-stage pipeline:
+### Single-step MPC (default planner)
+
+Uses a two-stage pipeline:
 
 1. **Geometric reference** — a 3-phase arc path (drive forward → reverse arc → straight into spot) computed analytically from the minimum turning radius.
 2. **MPC simulation** — a kinematic bicycle model is stepped forward under a receding-horizon MPC (horizon N=5, dt=0.05 s) that tracks the reference while penalising boundary violations. All four car body corners are checked at every step; any violation terminates planning and returns the collision waypoints for animation.
+
+### Multi-step MPC
+
+Extends feasibility into narrow lanes where single-step fails. Algorithm:
+
+1. **Drive forward** to the initial arc start position.
+2. **Reverse (attempt N)** — fresh arc reference rebuilt from the car's current heading; MPC tracks it toward the spot.
+3. **Correct** if any corner approaches the road edge: Phase A reverses with full right steer to regain y-clearance; Phase B drives forward to a safe x-position.
+4. Repeat 2–3 up to 5 times; declare success when the rear axle reaches the spot centre.
+
+**Demo case** (feasibility improvement):
+Set Car Length = 3.8 m, Car Width = 1.6 m, Lane Width = 4.2 m.  
+Single-step → COLLISION. Multi-step → 2-attempt success.
 
 ```
 wheelbase       = car_length × 0.65

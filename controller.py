@@ -144,6 +144,46 @@ class MPCController:
                        options={'maxiter': 40, 'ftol': 1e-5})
         return float(np.clip(res.x[0], -self.cc.max_steer, self.cc.max_steer))
 
+    def _optimize_goal(self, car: "CarDynamics", v: float, prev_delta: float,
+                       goal_x: float, goal_y: float, goal_th: float) -> float:
+        """Goal-directed optimize: drives toward an explicit (x,y,theta) target."""
+        def cost(deltas):
+            cx, cy, cth = car.x, car.y, car.theta
+            pd = prev_delta
+            total = 0.0
+            for d in deltas:
+                cx, cy, cth = self._step(cx, cy, cth, v, d)
+                dh = (cth - goal_th + math.pi) % (2 * math.pi) - math.pi
+                total += self.w_pos     * ((cx - goal_x) ** 2 + (cy - goal_y) ** 2)
+                total += self.w_heading * dh ** 2
+                total += self.w_delta   * d ** 2
+                total += self.w_ddelta  * (d - pd) ** 2
+                total += self.w_boundary * self._boundary_penalty(cx, cy, cth)
+                pd = d
+            return total
+
+        bounds = [(-self.cc.max_steer, self.cc.max_steer)] * self.N
+        x0 = np.full(self.N, prev_delta * 0.5)
+        res = minimize(cost, x0, method='SLSQP', bounds=bounds,
+                       options={'maxiter': 40, 'ftol': 1e-5})
+        return float(np.clip(res.x[0], -self.cc.max_steer, self.cc.max_steer))
+
+    def corners_warn(self, x: float, y: float, theta: float,
+                     warn_margin: float = 0.20) -> bool:
+        """True if every corner has at least warn_margin clearance from every boundary."""
+        corners = self.lot.car_corners((x, y, theta))
+        lane = self.lot.lane_rect
+        spot = self.lot.spot_rect
+        for cx, cy in corners:
+            if cy < lane.y + warn_margin:         return False
+            if cy > spot.top - warn_margin:       return False
+            if cx < lane.x + warn_margin:         return False
+            if cx > lane.right - warn_margin:     return False
+            if cy > lane.top - warn_margin:
+                if cx < spot.x + warn_margin:     return False
+                if cx > spot.right - warn_margin: return False
+        return True
+
     def corners_in_bounds(self, x: float, y: float, theta: float,
                           margin: float = 0.05) -> bool:
         """True if every car corner is within lane ∪ spot (with margin)."""

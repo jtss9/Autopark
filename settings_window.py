@@ -60,6 +60,7 @@ class SettingsWindow:
         self.var_car_len  = tk.DoubleVar(value=cc.length       if cc else 4.2)
         self.var_car_w    = tk.DoubleVar(value=cc.width        if cc else 1.8)
         self.var_type     = tk.StringVar(value=pc.parking_type if pc else "perpendicular")
+        self.var_planner  = tk.StringVar(value=pc.planner      if pc else "single")
 
         for *_, attr, _min, _max, _def in SLIDER_DEFS:
             getattr(self, attr).trace_add("write", self._on_change)
@@ -112,6 +113,20 @@ class SettingsWindow:
             side="left", padx=4)
         tk.Radiobutton(type_frame, text="Parallel Parking",
                        variable=self.var_type, value="parallel",
+                       bg=COLOR_BG, font=("Arial", 11)).pack(
+            side="left", padx=4)
+
+        tk.Label(left, text="Planner", bg=COLOR_BG,
+                 font=("Arial", 11)).grid(
+            row=n * 2 + 2, column=0, sticky="w", pady=(14, 2))
+        planner_frame = tk.Frame(left, bg=COLOR_BG)
+        planner_frame.grid(row=n * 2 + 3, column=0, sticky="w")
+        tk.Radiobutton(planner_frame, text="Single-step MPC",
+                       variable=self.var_planner, value="single",
+                       bg=COLOR_BG, font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(planner_frame, text="Multi-step MPC",
+                       variable=self.var_planner, value="multi",
                        bg=COLOR_BG, font=("Arial", 11)).pack(
             side="left", padx=4)
 
@@ -261,6 +276,7 @@ class SettingsWindow:
             spot_length=round(self.var_spot_len.get(), 1),
             spot_width=round(self.var_spot_w.get(), 1),
             parking_type=self.var_type.get(),
+            planner=self.var_planner.get(),
         )
 
     def _read_car_config(self) -> CarConfig:

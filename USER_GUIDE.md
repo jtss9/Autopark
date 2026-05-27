@@ -102,6 +102,8 @@ The HUD shows:
 - Minimum turning radius.
 - Current phase.
 - Current step.
+- Success/failure status.
+- Full-spot containment.
 - Planner metrics when available.
 
 ### What Step Means

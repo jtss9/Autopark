@@ -57,6 +57,83 @@ def plan_trajectory(
     return TrajectoryResult([], False, f"Unknown parking type: {pc.parking_type}")
 
 
+def _angle_diff(a: float, b: float) -> float:
+    return (a - b + math.pi) % (2 * math.pi) - math.pi
+
+
+def _goal_pose(lot: ParkingLot) -> tuple:
+    spot = lot.spot_rect
+    if lot.pc.parking_type == "parallel":
+        return spot.x + 0.15, spot.y + spot.h / 2, 0.0
+    return spot.x + spot.w / 2, spot.top - 0.15, -math.pi / 2
+
+
+def _path_length(waypoints: List[Waypoint]) -> float:
+    return sum(
+        math.hypot(b.x - a.x, b.y - a.y)
+        for a, b in zip(waypoints, waypoints[1:])
+    )
+
+
+def _fully_in_spot(lot: ParkingLot, waypoints: List[Waypoint]) -> bool:
+    if not waypoints:
+        return False
+    spot = lot.spot_rect
+    final = waypoints[-1]
+    return all(
+        spot.x <= x <= spot.right and spot.y <= y <= spot.top
+        for x, y in lot.car_corners((final.x, final.y, final.theta))
+    )
+
+
+def _result_with_metrics(
+    pc: ParkingConfig,
+    cc: CarConfig,
+    waypoints: List[Waypoint],
+    feasible: bool,
+    message: str,
+    phase_starts: List[int],
+    phase_names: List[str],
+    planning_time_s: float,
+    iterations: int = 0,
+) -> TrajectoryResult:
+    lot = ParkingLot(pc, cc)
+    goal = _goal_pose(lot)
+    fully_in_spot = _fully_in_spot(lot, waypoints)
+
+    final_pos_error = 0.0
+    final_heading_error = 0.0
+    if waypoints:
+        final = waypoints[-1]
+        final_pos_error = math.hypot(final.x - goal[0], final.y - goal[1])
+        final_heading_error = math.degrees(abs(_angle_diff(final.theta, goal[2])))
+
+    final_feasible = feasible and fully_in_spot
+    final_message = message
+    if feasible and not fully_in_spot:
+        final_message = "Final car is not fully inside the parking spot."
+
+    metrics = {
+        "planning_time_s": planning_time_s,
+        "iterations": iterations,
+        "expanded_states": len(waypoints),
+        "path_length_m": _path_length(waypoints),
+        "waypoints": len(waypoints),
+        "final_pos_error_m": final_pos_error,
+        "final_heading_error_deg": final_heading_error,
+        "fully_in_spot": fully_in_spot,
+        "obstacles": 0,
+    }
+    return TrajectoryResult(
+        waypoints,
+        final_feasible,
+        final_message,
+        phase_starts,
+        phase_names,
+        metrics,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Geometric reference planner (used internally by MPC planner)
 # ---------------------------------------------------------------------------
@@ -171,9 +248,10 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
         wps.append(Waypoint(car.x, car.y, car.theta))
         if not mpc.corners_in_bounds(car.x, car.y, car.theta):
             print(f" failed ({time.perf_counter() - t0:.1f}s)")
-            return TrajectoryResult(
+            return _result_with_metrics(
+                pc, cc,
                 wps, False, "Car body exceeded valid area during forward drive.",
-                phase_starts, phase_names)
+                phase_starts, phase_names, time.perf_counter() - t0, len(wps))
 
     # ── Phase 2+3: MPC reverse arc + straight into spot ────────────────────
     phase_starts.append(len(wps))
@@ -182,8 +260,10 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
 
     goal       = ref.waypoints[-1]
     prev_delta = 0.0
+    iterations = 0
 
     for _ in range(1500):
+        iterations += 1
         delta = mpc.optimize(car, -REVERSE_V, prev_delta)
         car.step(-REVERSE_V, delta, dt)
         prev_delta = delta
@@ -191,10 +271,11 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
         if not mpc.corners_in_bounds(car.x, car.y, car.theta):
             print(f" failed ({time.perf_counter() - t0:.1f}s)")
             wps.append(Waypoint(car.x, car.y, car.theta))  # include collision pose
-            return TrajectoryResult(
+            return _result_with_metrics(
+                pc, cc,
                 wps, False,
                 "Car body exceeded valid area — try a wider lane or shorter car.",
-                phase_starts, phase_names)
+                phase_starts, phase_names, time.perf_counter() - t0, iterations)
 
         wps.append(Waypoint(car.x, car.y, car.theta))
 
@@ -204,13 +285,15 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
             break
     else:
         print(f" timed out ({time.perf_counter() - t0:.1f}s)")
-        return TrajectoryResult(
+        return _result_with_metrics(
+            pc, cc,
             wps, False, "MPC: could not reach parking goal within step limit.",
-            phase_starts, phase_names)
+            phase_starts, phase_names, time.perf_counter() - t0, iterations)
 
     elapsed = time.perf_counter() - t0
     print(f" done in {elapsed:.1f}s ({len(wps)} waypoints)")
-    return TrajectoryResult(wps, True, "OK", phase_starts, phase_names)
+    return _result_with_metrics(
+        pc, cc, wps, True, "OK", phase_starts, phase_names, elapsed, iterations)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +358,7 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
 
     t0 = time.perf_counter()
     print("Planning multi-step MPC trajectory...", end="", flush=True)
+    iterations = 0
 
     # ── Phase 1: straight forward to x_stop ───────────────────────────────────
     while car.x < x_stop - 0.05:
@@ -282,9 +366,10 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
         wps.append(Waypoint(car.x, car.y, car.theta))
         if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
             print(f" failed ({time.perf_counter() - t0:.1f}s)")
-            return TrajectoryResult(
+            return _result_with_metrics(
+                pc, cc,
                 wps, False, "Car body exceeded valid area during forward drive.",
-                phase_starts, phase_names)
+                phase_starts, phase_names, time.perf_counter() - t0, len(wps))
 
     # ── Phase 2+: alternating REVERSING / FORWARD_CORRECT ─────────────────────
     prev_delta = 0.0
@@ -300,6 +385,7 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
 
         near_boundary = False
         for _ in range(1500):
+            iterations += 1
             delta = rev_mpc.optimize(car, -REVERSE_V, prev_delta)
             car.step(-REVERSE_V, delta, dt)
             prev_delta = delta
@@ -307,10 +393,11 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
             if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
                 wps.append(Waypoint(car.x, car.y, car.theta))
                 print(f" failed ({time.perf_counter() - t0:.1f}s)")
-                return TrajectoryResult(
+                return _result_with_metrics(
+                    pc, cc,
                     wps, False,
                     "Car body exceeded valid area — try a wider lane or shorter car.",
-                    phase_starts, phase_names)
+                    phase_starts, phase_names, time.perf_counter() - t0, iterations)
 
             wps.append(Waypoint(car.x, car.y, car.theta))
 
@@ -320,7 +407,9 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
                 elapsed = time.perf_counter() - t0
                 print(f" done in {elapsed:.1f}s ({len(wps)} waypoints, "
                       f"{attempt} attempt(s))")
-                return TrajectoryResult(wps, True, "OK", phase_starts, phase_names)
+                return _result_with_metrics(
+                    pc, cc, wps, True, "OK", phase_starts, phase_names,
+                    elapsed, iterations)
 
             # Only trigger correction for road-bottom approach — the MPC
             # boundary penalty handles spot/side boundaries.
@@ -342,14 +431,16 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
 
         # Phase A
         for _ in range(100):
+            iterations += 1
             car.step(-REVERSE_V, -cc.max_steer, dt)
             prev_delta = -cc.max_steer
             wps.append(Waypoint(car.x, car.y, car.theta))
             if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
                 print(f" failed ({time.perf_counter() - t0:.1f}s)")
-                return TrajectoryResult(
+                return _result_with_metrics(
+                    pc, cc,
                     wps, False, "Car body exceeded valid area during correction.",
-                    phase_starts, phase_names)
+                    phase_starts, phase_names, time.perf_counter() - t0, iterations)
             if abs(car.theta) < math.radians(5):
                 break
 
@@ -369,19 +460,22 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
         x_target = max(x_target, car.x + 0.30)        # always drive at least 30 cm
 
         for _ in range(300):
+            iterations += 1
             car.step(FORWARD_V, 0.0, dt)
             prev_delta = 0.0
             wps.append(Waypoint(car.x, car.y, car.theta))
             if not bounds_mpc.corners_in_bounds(car.x, car.y, car.theta):
                 print(f" failed ({time.perf_counter() - t0:.1f}s)")
-                return TrajectoryResult(
+                return _result_with_metrics(
+                    pc, cc,
                     wps, False, "Car body exceeded valid area during correction.",
-                    phase_starts, phase_names)
+                    phase_starts, phase_names, time.perf_counter() - t0, iterations)
             if car.x >= x_target - 0.05:
                 break
 
     print(f" timed out ({time.perf_counter() - t0:.1f}s)")
-    return TrajectoryResult(
+    return _result_with_metrics(
+        pc, cc,
         wps, False,
         f"Could not park within {MAX_ATTEMPTS} attempts.",
-        phase_starts, phase_names)
+        phase_starts, phase_names, time.perf_counter() - t0, iterations)

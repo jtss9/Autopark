@@ -156,3 +156,13 @@ Observed validation notes:
 - The local Python environment used for validation does not have SciPy, so baseline rows are skipped cleanly.
 - Parallel all-scenario Hybrid A* smoke test succeeded for all five scenarios.
 - Perpendicular all-scenario Hybrid A* smoke test succeeded for four of five scenarios; `tight_lane` correctly produced an infeasible/no-path row at the current default dimensions.
+
+## HUD And Baseline Metrics Update
+
+Continued Week 1 demo polish:
+
+- Added shared trajectory metrics for MPC-based planners, not only Hybrid A*.
+- Standardized MPC result metrics with `planning_time_s`, `iterations`, `expanded_states`, `path_length_m`, `waypoints`, final pose error, heading error, `fully_in_spot`, and obstacle count.
+- Tightened MPC success so a nominally feasible plan is marked failed if the final car rectangle is not fully inside the spot.
+- Updated the pygame HUD to always show status, phase, step, path length, planning time, final position error, heading error, and full-spot containment when metrics are available.
+- Replaced the failure overlay text with `FAILED`, because failures can be collision, no path, timeout, or final-containment failure.

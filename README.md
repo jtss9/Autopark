@@ -94,9 +94,13 @@ Animates the full parking trajectory computed by the selected planner.
 | `S` | Return to settings (preserves last slider values) |
 | `ESC` / `Q` | Quit |
 
-The HUD shows parking type, active planner, scenario, dimensions, current phase name, step counter, and planner metrics when available.
+The HUD shows parking type, active planner, scenario, dimensions, status,
+current phase name, step counter, final containment, and planner metrics when
+available.
 
-**Feasibility**: if the car body would clip a boundary during the maneuver, the animation plays up to the collision frame, then freezes — the car turns red and a **COLLISION** overlay is displayed.
+**Feasibility**: if the car body would clip a boundary or the final pose is not
+fully inside the spot, the animation plays to the last available waypoint, the
+car turns red, and a **FAILED** overlay plus concrete failure message is shown.
 
 ---
 

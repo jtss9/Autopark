@@ -201,25 +201,36 @@ class Simulation:
         collision_frame = (not self.result.feasible
                            and bool(wps)
                            and step >= total)
+        metrics = self.result.metrics
+        status = "SUCCESS" if self.result.feasible else "FAILED"
+        status_color = C_PATH_DONE if self.result.feasible else C_WARN
+        full_spot = metrics.get("fully_in_spot", False)
+
+        lines.append((font_b, f"Status: {status}", status_color))
+        lines.append((font, f"Phase: {phase_name}", C_TEXT))
+        lines.append((font, f"Step: {min(step, total)} / {total}", C_DIM))
+        if metrics:
+            lines.append((
+                font,
+                f"Path: {metrics.get('path_length_m', 0.0):.1f} m  |  "
+                f"Plan: {metrics.get('planning_time_s', 0.0):.2f}s  |  "
+                f"Final err: {metrics.get('final_pos_error_m', 0.0):.2f} m",
+                C_DIM,
+            ))
+            lines.append((
+                font,
+                f"Heading err: {metrics.get('final_heading_error_deg', 0.0):.1f} deg  |  "
+                f"Fully in spot: {full_spot}",
+                C_DIM,
+            ))
+
         if not self.result.feasible:
             lines.append((font_b, f"[!] {self.result.message}", C_WARN))
             if collision_frame:
                 font_big = pygame.font.SysFont("Arial", 36, bold=True)
-                label = font_big.render("COLLISION", True, C_WARN)
+                label = font_big.render("FAILED", True, C_WARN)
                 surf.blit(label, label.get_rect(
                     center=(WIN_W // 2, WIN_H // 2)))
-        else:
-            lines.append((font, f"Phase: {phase_name}", C_TEXT))
-            lines.append((font, f"Step: {min(step, total)} / {total}", C_DIM))
-            if self.result.metrics:
-                metrics = self.result.metrics
-                lines.append((
-                    font,
-                    f"Path: {metrics['path_length_m']:.1f} m  |  "
-                    f"Plan: {metrics['planning_time_s']:.2f}s  |  "
-                    f"Final err: {metrics['final_pos_error_m']:.2f} m",
-                    C_DIM,
-                ))
 
         lines += [
             (font, "SPACE  pause / resume", (100, 100, 100)),

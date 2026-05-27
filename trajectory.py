@@ -31,12 +31,28 @@ class TrajectoryResult:
     message: str
     phase_starts: List[int] = field(default_factory=list)
     phase_names:  List[str] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)
 
 
-def plan_trajectory(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResult:
+def plan_trajectory(
+    pc: ParkingConfig,
+    cc: CarConfig,
+    planner: str = "baseline",
+) -> TrajectoryResult:
+    if planner == "hybrid_astar":
+        from hybrid_astar import plan_hybrid_astar
+        return plan_hybrid_astar(pc, cc)
+
+    if pc.obstacle_scenario != "none":
+        from hybrid_astar import plan_hybrid_astar
+        return plan_hybrid_astar(pc, cc)
+
     if pc.parking_type == "perpendicular":
         return _plan_perpendicular_mpc(pc, cc)
-    return TrajectoryResult([], False, "Parallel parking not yet implemented.")
+    if pc.parking_type == "parallel":
+        from hybrid_astar import plan_hybrid_astar
+        return plan_hybrid_astar(pc, cc)
+    return TrajectoryResult([], False, f"Unknown parking type: {pc.parking_type}")
 
 
 # ---------------------------------------------------------------------------

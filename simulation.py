@@ -10,6 +10,7 @@ import pygame
 
 from config import CarConfig, ParkingConfig
 from parking_lot import ParkingLot
+from scenarios import obstacles_for
 from trajectory import TrajectoryResult, plan_trajectory
 
 WIN_W, WIN_H = 960, 640
@@ -26,6 +27,8 @@ C_DIM        = (160, 160, 160)
 C_PATH_PLAN  = (80,  160, 255)   # full planned path
 C_PATH_DONE  = (80,  220, 120)   # already-travelled portion
 C_WARN       = (255,  80,  80)
+C_OBSTACLE   = (190,  45,  45)
+C_OBS_LINE   = (255, 190, 190)
 
 # Waypoints advanced per frame (controls animation speed)
 SPEED = 2
@@ -37,7 +40,21 @@ class Simulation:
         self.cc  = car_config
         self.lot = ParkingLot(parking_config, car_config)
         self._compute_scale()
-        self.result: TrajectoryResult = plan_trajectory(parking_config, car_config)
+        requested_planner = os.environ.get("AUTOPARK_PLANNER", "baseline")
+        self.planner_name = self._effective_planner_name(requested_planner)
+        self.result: TrajectoryResult = plan_trajectory(
+            parking_config,
+            car_config,
+            planner=requested_planner,
+        )
+        self.animation_speed = 1 if parking_config.parking_type == "parallel" else SPEED
+
+    def _effective_planner_name(self, requested_planner: str) -> str:
+        if requested_planner == "hybrid_astar":
+            return "hybrid_astar"
+        if self.pc.parking_type == "parallel" or self.pc.obstacle_scenario != "none":
+            return "hybrid_astar"
+        return requested_planner
 
     # ------------------------------------------------------------------
     # Coordinate transform
@@ -127,6 +144,14 @@ class Simulation:
         lbl = font_s.render("Spot", True, C_SPOT_LINE)
         surf.blit(lbl, lbl.get_rect(center=spot_r.center))
 
+        for obs in obstacles_for(self.lot):
+            ox1, oy1 = self.w2s(obs.x, obs.top)
+            ox2, oy2 = self.w2s(obs.right, obs.y)
+            obs_r = pygame.Rect(min(ox1, ox2), min(oy1, oy2),
+                                abs(ox2 - ox1), abs(oy2 - oy1))
+            pygame.draw.rect(surf, C_OBSTACLE, obs_r)
+            pygame.draw.rect(surf, C_OBS_LINE, obs_r, 1)
+
         # Planned path + travelled path
         self._draw_path(surf, step)
 
@@ -162,6 +187,8 @@ class Simulation:
 
         lines = [
             (font_b, f"Parking type: {type_label}",                 C_TEXT),
+            (font,   f"Planner: {self.planner_name}",                C_DIM),
+            (font,   f"Scenario: {self.pc.obstacle_scenario}",        C_DIM),
             (font,   f"Lane: {self.pc.lane_width:.1f} m  |  "
                      f"Spot: {self.pc.spot_length:.1f}x{self.pc.spot_width:.1f} m  |  "
                      f"Car: {self.cc.length:.1f}x{self.cc.width:.1f} m",  C_DIM),
@@ -181,6 +208,15 @@ class Simulation:
         else:
             lines.append((font, f"Phase: {phase_name}", C_TEXT))
             lines.append((font, f"Step: {min(step, total)} / {total}", C_DIM))
+            if self.result.metrics:
+                metrics = self.result.metrics
+                lines.append((
+                    font,
+                    f"Path: {metrics['path_length_m']:.1f} m  |  "
+                    f"Plan: {metrics['planning_time_s']:.2f}s  |  "
+                    f"Final err: {metrics['final_pos_error_m']:.2f} m",
+                    C_DIM,
+                ))
 
         lines += [
             (font, "SPACE  pause / resume", (100, 100, 100)),
@@ -227,7 +263,7 @@ class Simulation:
                         running = False
 
             if not paused and step < total:
-                step = min(step + SPEED, total)
+                step = min(step + self.animation_speed, total)
 
             self._draw_scene(screen, step)
             pygame.display.flip()

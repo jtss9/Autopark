@@ -3,6 +3,12 @@
 A top-down 2D parking simulation built for the *Introduction to Smart Cars* course final project.  
 Configure road and vehicle dimensions, then watch the car automatically execute a parking maneuver guided by an MPC controller.
 
+The current MPC arc planner is the baseline. The project is being extended
+toward a map-based autonomous parking stack with Hybrid A* planning; see
+`PROJECT_SCOPE.md`.
+
+For operating instructions, see `USER_GUIDE.md`.
+
 ---
 
 ## Requirements
@@ -29,6 +35,18 @@ cd path/to/final
 python main.py
 ```
 
+To try the initial Hybrid A* planner in the simulator:
+
+```bash
+AUTOPARK_PLANNER=hybrid_astar python main.py
+```
+
+To run batch evaluation metrics:
+
+```bash
+python evaluate.py
+```
+
 ---
 
 ## Usage
@@ -47,7 +65,11 @@ Adjust all parameters using the sliders on the left. The preview canvas on the r
 
 **Parking Type**
 - **Reverse into Spot (倒車入庫)** — car starts parallel to the road and reverses perpendicularly into the spot
-- **Parallel Parking (路邊停車)** — not yet implemented
+- **Parallel Parking (路邊停車)** — planned with Hybrid A*
+
+**Scenario**
+- **Clear** — empty parking environment
+- **Obstacle** — adds one occupied region to the map so Hybrid A* plans with an occupancy-grid constraint
 
 If the car is too large for the spot, the spot outline turns red and simulation is blocked until dimensions are corrected.
 
@@ -55,7 +77,7 @@ Click **Start Simulation** to proceed.
 
 ### Phase 2 — Simulation Window
 
-Animates the full parking trajectory computed by the MPC planner.
+Animates the full parking trajectory computed by the selected planner.
 
 | Key | Action |
 |---|---|
@@ -64,7 +86,7 @@ Animates the full parking trajectory computed by the MPC planner.
 | `S` | Return to settings (preserves last slider values) |
 | `ESC` / `Q` | Quit |
 
-The HUD shows parking type, dimensions, current phase name, and step counter.
+The HUD shows parking type, active planner, scenario, dimensions, current phase name, step counter, and planner metrics when available.
 
 **Feasibility**: if the car body would clip a boundary during the maneuver, the animation plays up to the collision frame, then freezes — the car turns red and a **COLLISION** overlay is displayed.
 
@@ -77,10 +99,15 @@ final/
 ├── main.py              # Entry point: settings → simulation loop
 ├── config.py            # CarConfig and ParkingConfig dataclasses
 ├── parking_lot.py       # World-space geometry (lane, spot, car corners)
+├── scenarios.py         # Static obstacle scenarios
 ├── settings_window.py   # Phase 1: tkinter settings UI with live preview
 ├── trajectory.py        # Trajectory planner (geometric reference + MPC)
+├── hybrid_astar.py      # Initial occupancy-grid Hybrid A* planner
 ├── controller.py        # Bicycle kinematic model and MPC controller
 ├── simulation.py        # Phase 2: pygame animation loop
+├── evaluate.py          # Batch CSV evaluation runner
+├── PROJECT_SCOPE.md     # Upgraded final-project scope and implementation plan
+├── USER_GUIDE.md        # How to run and interact with the simulator
 └── requirements.txt
 ```
 
@@ -107,3 +134,15 @@ wheelbase       = car_length × 0.65
 max_steer_angle = 35°
 R_min           = wheelbase / tan(max_steer_angle)  ≈ 3–5 m
 ```
+
+The new Hybrid A* path is opt-in with `AUTOPARK_PLANNER=hybrid_astar`. It
+searches over `(x, y, theta)` using forward/reverse bicycle-model motion
+primitives and validates every candidate pose with full car-corner collision
+checking.
+
+Parallel parking now uses Hybrid A* by default because the old geometric/MPC
+baseline only supports perpendicular parking.
+
+Hybrid A* reports metrics including planning time, expanded states, path length,
+waypoint count, final position/heading error, obstacle count, and whether the
+final vehicle rectangle is fully inside the parking spot.

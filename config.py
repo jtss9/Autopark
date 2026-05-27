@@ -24,3 +24,4 @@ class ParkingConfig:
     spot_length: float = 6.0
     spot_width: float = 2.5
     parking_type: str = "perpendicular"  # "perpendicular" | "parallel"
+    obstacle_scenario: str = "none"       # "none" | "entry_blocker"

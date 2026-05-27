@@ -24,4 +24,4 @@ class ParkingConfig:
     spot_length: float = 6.0
     spot_width: float = 2.5
     parking_type: str = "perpendicular"  # "perpendicular" | "parallel"
-    planner: str = "single"             # "single" | "multi"
+    planner: str = "single"             # "single" | "multi" | "rl" | "hastar"

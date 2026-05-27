@@ -19,7 +19,7 @@ COLOR_BG        = "#f5f5f5"
 
 # (display label, var attribute name, slider min, slider max, default)
 SLIDER_DEFS = [
-    ("Lane Width (m)",  "var_lane_w",   3.5, 5.5,  4.0),
+    ("Lane Width (m)",  "var_lane_w",   3.5, 5.5,  4.4),
     ("Spot Length (m)", "var_spot_len", 5.0, 6.0,  5.5),
     ("Spot Width (m)",  "var_spot_w",   2.0, 3.0,  2.5),
     ("Car Length (m)",  "var_car_len",  3.5, 5.0,  4.2),
@@ -54,7 +54,7 @@ class SettingsWindow:
         pc = self._initial_parking
         cc = self._initial_car
 
-        self.var_lane_w   = tk.DoubleVar(value=pc.lane_width   if pc else 4.0)
+        self.var_lane_w   = tk.DoubleVar(value=pc.lane_width   if pc else 4.4)
         self.var_spot_len = tk.DoubleVar(value=pc.spot_length  if pc else 5.5)
         self.var_spot_w   = tk.DoubleVar(value=pc.spot_width   if pc else 2.5)
         self.var_car_len  = tk.DoubleVar(value=cc.length       if cc else 4.2)
@@ -127,6 +127,10 @@ class SettingsWindow:
             side="left", padx=4)
         tk.Radiobutton(planner_frame, text="Multi-step MPC",
                        variable=self.var_planner, value="multi",
+                       bg=COLOR_BG, font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(planner_frame, text="Hybrid A*",
+                       variable=self.var_planner, value="hastar",
                        bg=COLOR_BG, font=("Arial", 11)).pack(
             side="left", padx=4)
 

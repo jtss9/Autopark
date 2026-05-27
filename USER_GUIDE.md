@@ -36,6 +36,7 @@ Run batch evaluation:
 
 ```bash
 python evaluate.py
+python evaluate.py --mode all --scenario all --planner hybrid_astar --output results/demo.csv
 ```
 
 ## 3. Settings Window
@@ -70,7 +71,9 @@ Choose one:
 Choose one:
 
 - **Clear**: no extra obstacle.
-- **Obstacle**: adds one occupied region to the parking map.
+- **Entry Blocker**: adds one occupied region near the spot entry.
+- **Tight Lane**: evaluator scenario for narrow-lane tests.
+- **Parked Cars**: adds parked-car obstacle rectangles around the target.
 
 Obstacle scenarios automatically use Hybrid A* because the baseline planner does
 not reason over occupancy-grid obstacles.
@@ -168,7 +171,11 @@ Hybrid A* reports metrics that are useful for final-project analysis:
 | `iterations` | Search-loop iterations |
 | `expanded_states` | Number of stored search states |
 | `path_length_m` | Total geometric path length |
+| `raw_path_length_m` | Hybrid A* path length before waypoint cleanup |
+| `smoothed_path_length_m` | Path length after waypoint cleanup |
 | `waypoints` | Number of output waypoints |
+| `raw_waypoints` | Waypoints before cleanup |
+| `smoothed_waypoints` | Waypoints after cleanup |
 | `final_pos_error_m` | Final distance from goal pose |
 | `final_heading_error_deg` | Final heading error in degrees |
 | `fully_in_spot` | Whether the final car rectangle is fully inside the spot |
@@ -180,12 +187,25 @@ Use:
 python evaluate.py
 ```
 
-This prints CSV rows for:
+Useful evaluator options:
 
-- Perpendicular clear.
-- Perpendicular obstacle.
-- Parallel clear.
-- Parallel obstacle.
+```bash
+python evaluate.py --mode perpendicular --scenario clear
+python evaluate.py --mode parallel --scenario all --planner hybrid_astar
+python evaluate.py --mode all --scenario all --sweep lane_width --planner hybrid_astar --output results/lane_width.csv
+```
+
+CLI arguments:
+
+- `--mode perpendicular|parallel|all`
+- `--scenario clear|obstacle|tight|none|entry_blocker|tight_lane|pillar_near_entry|parked_cars|all`
+- `--planner baseline|hybrid_astar|all`
+- `--sweep lane_width|spot_size|car_size|none`
+- `--output path.csv`
+
+When `--output` is omitted, CSV rows are written to stdout and the summary is
+written to stderr. When `--output` is provided, the CSV is written to that file
+and the summary is printed to stdout.
 
 ## 7. Recommended Demo Flow
 
@@ -204,7 +224,7 @@ This prints CSV rows for:
 ## 8. Current Limitations
 
 - Hybrid A* is functional but not optimized; parallel cases can take several seconds.
-- The path is not smoothed yet.
+- Hybrid A* currently uses lightweight waypoint cleanup, not full optimal-control smoothing.
 - Obstacles are simple static rectangles, not sensor-derived dynamic obstacles.
 - There is no CARLA integration yet.
 - The baseline planner depends on SciPy.
@@ -212,9 +232,8 @@ This prints CSV rows for:
 ## 9. Suggested Next Improvements
 
 - Add harder obstacle layouts.
-- Add path smoothing after Hybrid A*.
+- Add stronger path smoothing after Hybrid A*.
 - Add a controller-tracking error metric.
 - Add repeated trials over lane widths and spot sizes.
 - Export evaluation results to CSV files.
 - Integrate a CARLA parking-lot scene.
-

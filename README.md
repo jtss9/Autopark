@@ -45,6 +45,7 @@ To run batch evaluation metrics:
 
 ```bash
 python evaluate.py
+python evaluate.py --mode all --scenario all --planner hybrid_astar --output results/demo.csv
 ```
 
 ---
@@ -69,11 +70,14 @@ Adjust all parameters using the sliders on the left. The preview canvas on the r
 
 **Scenario**
 - **Clear** — empty parking environment
-- **Obstacle** — adds one occupied region to the map so Hybrid A* plans with an occupancy-grid constraint
+- **Entry Blocker** — adds one occupied region near the parking entry
+- **Tight Lane** — used by the evaluator as a narrow-lane scenario
+- **Parked Cars** — adds parked-car obstacle rectangles around the target
 
 **Planner**
 - **Single-step MPC** — tracks a pre-computed geometric arc; succeeds in wider lanes, fails with COLLISION in narrow ones
 - **Multi-step MPC** — uses alternating reverse/correction attempts; extends the feasibility boundary into narrower lanes where single-step fails
+- **Hybrid A*** — map-based planner for perpendicular, parallel, and obstacle-aware scenarios
 
 If the car is too large for the spot, the spot outline turns red and simulation is blocked until dimensions are corrected.
 
@@ -162,6 +166,14 @@ checking.
 Parallel parking now uses Hybrid A* by default because the old geometric/MPC
 baseline only supports perpendicular parking.
 
-Hybrid A* reports metrics including planning time, expanded states, path length,
-waypoint count, final position/heading error, obstacle count, and whether the
-final vehicle rectangle is fully inside the parking spot.
+Hybrid A* reports metrics including planning time, expanded states, raw and
+smoothed path length, waypoint count, final position/heading error, obstacle
+count, and whether the final vehicle rectangle is fully inside the parking spot.
+
+`evaluate.py` is the report-facing CLI. Useful examples:
+
+```bash
+python evaluate.py
+python evaluate.py --mode parallel --scenario all --planner hybrid_astar
+python evaluate.py --mode all --scenario all --sweep lane_width --planner hybrid_astar --output results/lane_width.csv
+```

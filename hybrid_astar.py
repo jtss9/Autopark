@@ -186,7 +186,8 @@ class HybridAStarPlanner:
             current = nodes[current_idx]
 
             if self._reached_goal((current.x, current.y, current.theta), goal):
-                wps = self._reconstruct(current_idx, nodes)
+                raw_wps = self._reconstruct(current_idx, nodes)
+                wps = self._smooth_path(raw_wps)
                 elapsed = time.perf_counter() - start_t
                 metrics = self._metrics(
                     wps,
@@ -194,6 +195,7 @@ class HybridAStarPlanner:
                     elapsed,
                     iterations,
                     len(nodes),
+                    raw_wps,
                 )
                 return TrajectoryResult(
                     wps,
@@ -301,6 +303,57 @@ class HybridAStarPlanner:
         path.reverse()
         return path
 
+    def _segment_is_valid(self, a: Waypoint, b: Waypoint) -> bool:
+        dist = math.hypot(b.x - a.x, b.y - a.y)
+        steps = max(2, int(math.ceil(dist / 0.12)))
+        for i in range(steps + 1):
+            t = i / steps
+            x = a.x + (b.x - a.x) * t
+            y = a.y + (b.y - a.y) * t
+            theta = a.theta + _angle_diff(b.theta, a.theta) * t
+            if not self.grid.pose_is_valid((x, y, theta)):
+                return False
+        return True
+
+    def _smooth_path(self, waypoints: Sequence[Waypoint]) -> List[Waypoint]:
+        if len(waypoints) <= 2:
+            return list(waypoints)
+
+        cleaned = [waypoints[0]]
+        for wp in waypoints[1:]:
+            prev = cleaned[-1]
+            if math.hypot(wp.x - prev.x, wp.y - prev.y) < 0.05:
+                continue
+            cleaned.append(wp)
+
+        if len(cleaned) <= 2:
+            return cleaned
+
+        smoothed = [cleaned[0]]
+        for i in range(1, len(cleaned) - 1):
+            a = smoothed[-1]
+            b = cleaned[i]
+            c = cleaned[i + 1]
+            ab = math.atan2(b.y - a.y, b.x - a.x)
+            bc = math.atan2(c.y - b.y, c.x - b.x)
+            heading_change = abs(_angle_diff(ab, bc))
+            car_heading_change = abs(_angle_diff(c.theta, a.theta))
+            if (
+                heading_change < math.radians(7)
+                and car_heading_change < math.radians(10)
+                and self._segment_is_valid(a, c)
+            ):
+                continue
+            smoothed.append(b)
+        smoothed.append(cleaned[-1])
+        return smoothed
+
+    def _path_length(self, waypoints: Sequence[Waypoint]) -> float:
+        return sum(
+            math.hypot(b.x - a.x, b.y - a.y)
+            for a, b in zip(waypoints, waypoints[1:])
+        )
+
     def _metrics(
         self,
         waypoints: Sequence[Waypoint],
@@ -308,10 +361,11 @@ class HybridAStarPlanner:
         planning_time_s: float,
         iterations: int,
         expanded_states: int,
+        raw_waypoints: Optional[Sequence[Waypoint]] = None,
     ) -> dict:
-        path_length = 0.0
-        for a, b in zip(waypoints, waypoints[1:]):
-            path_length += math.hypot(b.x - a.x, b.y - a.y)
+        raw_waypoints = raw_waypoints or waypoints
+        path_length = self._path_length(waypoints)
+        raw_path_length = self._path_length(raw_waypoints)
 
         final = waypoints[-1]
         final_pose = (final.x, final.y, final.theta)
@@ -323,7 +377,11 @@ class HybridAStarPlanner:
             "iterations": iterations,
             "expanded_states": expanded_states,
             "path_length_m": path_length,
+            "raw_path_length_m": raw_path_length,
+            "smoothed_path_length_m": path_length,
             "waypoints": len(waypoints),
+            "raw_waypoints": len(raw_waypoints),
+            "smoothed_waypoints": len(waypoints),
             "final_pos_error_m": final_pos_error,
             "final_heading_error_deg": math.degrees(final_heading_error),
             "fully_in_spot": self.grid.pose_is_fully_in_spot(final_pose, margin=0.0),

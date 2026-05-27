@@ -40,7 +40,10 @@ class Simulation:
         self.cc  = car_config
         self.lot = ParkingLot(parking_config, car_config)
         self._compute_scale()
-        requested_planner = os.environ.get("AUTOPARK_PLANNER", "baseline")
+        requested_planner = os.environ.get(
+            "AUTOPARK_PLANNER",
+            "hybrid_astar" if parking_config.planner == "hybrid_astar" else "baseline",
+        )
         self.planner_name = self._effective_planner_name(requested_planner)
         self.result: TrajectoryResult = plan_trajectory(
             parking_config,

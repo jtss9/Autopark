@@ -112,3 +112,47 @@ Documentation maintenance:
 - Added `USER_GUIDE.md` with setup, settings, controls, planner modes, metrics, evaluation workflow, limitations, and suggested next improvements.
 - Linked `USER_GUIDE.md` from `README.md`.
 - Updated `PROJECT_SCOPE.md` with a staged roadmap for a stronger final demo: parameter sweeps, harder scenarios, algorithm comparison, smoothing, closed-loop tracking, visualization, and CARLA stretch integration.
+
+## Latest Main Merge And Evaluation Upgrade
+
+Merged the latest `origin/main` into `mason-implement`:
+
+- Main added `ParkingConfig.planner`.
+- Main added the multi-step MPC planner for narrow-lane perpendicular parking.
+- The merge resolution preserved both main's `planner` field and this branch's `obstacle_scenario` field.
+- The settings window now exposes Single-step MPC, Multi-step MPC, and Hybrid A*.
+
+Expanded the report-facing evaluator:
+
+- Added CLI options for `--mode`, `--scenario`, `--planner`, `--sweep`, and `--output`.
+- Added stable CSV columns for mode, scenario, planner, dimensions, feasibility, success, planning metrics, final-pose metrics, and full-spot containment.
+- Added baseline comparison rows where applicable.
+- Added clean skip rows when the baseline cannot run, including when SciPy is unavailable.
+- Added output-file support with automatic parent directory creation.
+- Kept stdout CSV behavior when `--output` is omitted, with the aggregate summary written to stderr.
+
+Expanded scenarios:
+
+- Added canonical scenario names: `none`, `entry_blocker`, `tight_lane`, `pillar_near_entry`, and `parked_cars`.
+- Added aliases for evaluator convenience: `clear`, `obstacle`, and `tight`.
+- Added obstacle rectangles for entry blockers, pillars, and parked cars.
+
+Added lightweight Hybrid A* path cleanup:
+
+- Removes near-duplicate and nearly collinear waypoints.
+- Preserves the first and final waypoint.
+- Rejects cleanup segments that collide or leave valid lane/spot bounds.
+- Reports raw and smoothed path lengths and waypoint counts.
+
+Validation:
+
+- `python3 -m py_compile config.py parking_lot.py scenarios.py trajectory.py hybrid_astar.py simulation.py settings_window.py evaluate.py`
+- `python3 evaluate.py --mode perpendicular --scenario clear --planner all`
+- `python3 evaluate.py --mode parallel --scenario all --planner hybrid_astar --output /tmp/autopark_parallel.csv`
+- `python3 evaluate.py --mode perpendicular --scenario all --planner hybrid_astar --output /tmp/autopark_perpendicular.csv`
+
+Observed validation notes:
+
+- The local Python environment used for validation does not have SciPy, so baseline rows are skipped cleanly.
+- Parallel all-scenario Hybrid A* smoke test succeeded for all five scenarios.
+- Perpendicular all-scenario Hybrid A* smoke test succeeded for four of five scenarios; `tight_lane` correctly produced an infeasible/no-path row at the current default dimensions.

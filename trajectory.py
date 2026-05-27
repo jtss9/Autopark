@@ -39,7 +39,7 @@ def plan_trajectory(
     cc: CarConfig,
     planner: str = "baseline",
 ) -> TrajectoryResult:
-    if planner == "hybrid_astar":
+    if planner == "hybrid_astar" or pc.planner == "hybrid_astar":
         from hybrid_astar import plan_hybrid_astar
         return plan_hybrid_astar(pc, cc)
 

@@ -68,11 +68,13 @@ class SettingsWindow:
         self.var_car_w    = tk.DoubleVar(value=cc.width        if cc else 1.8)
         self.var_type     = tk.StringVar(value=pc.parking_type if pc else "perpendicular")
         self.var_obstacle = tk.StringVar(value=pc.obstacle_scenario if pc else "none")
+        self.var_planner  = tk.StringVar(value=pc.planner      if pc else "single")
 
         for *_, attr, _min, _max, _def in SLIDER_DEFS:
             getattr(self, attr).trace_add("write", self._on_change)
         self.var_type.trace_add("write", self._on_change)
         self.var_obstacle.trace_add("write", self._on_change)
+        self.var_planner.trace_add("write", self._on_change)
 
     # ------------------------------------------------------------------
     # UI layout
@@ -151,6 +153,44 @@ class SettingsWindow:
             side="left", padx=4)
         tk.Radiobutton(scenario_frame, text="Obstacle",
                        variable=self.var_obstacle, value="entry_blocker",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(scenario_frame, text="Tight",
+                       variable=self.var_obstacle, value="tight_lane",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(scenario_frame, text="Parked Cars",
+                       variable=self.var_obstacle, value="parked_cars",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+
+        tk.Label(left, text="Planner", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=("Arial", 11)).grid(
+            row=n * 2 + 4, column=0, sticky="w", pady=(14, 2))
+        planner_frame = tk.Frame(left, bg=COLOR_PANEL)
+        planner_frame.grid(row=n * 2 + 5, column=0, sticky="w")
+        tk.Radiobutton(planner_frame, text="Single-step MPC",
+                       variable=self.var_planner, value="single",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(planner_frame, text="Multi-step MPC",
+                       variable=self.var_planner, value="multi",
                        bg=COLOR_PANEL, fg=COLOR_TEXT,
                        activebackground=COLOR_PANEL,
                        activeforeground=COLOR_TEXT,
@@ -316,6 +356,7 @@ class SettingsWindow:
             spot_width=round(self.var_spot_w.get(), 1),
             parking_type=self.var_type.get(),
             obstacle_scenario=self.var_obstacle.get(),
+            planner=self.var_planner.get(),
         )
 
     def _read_car_config(self) -> CarConfig:

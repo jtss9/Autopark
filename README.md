@@ -138,6 +138,9 @@ final/
 ├── simulation.py        # Phase 2: pygame animation loop
 ├── evaluate.py          # Batch CSV evaluation runner with --track and --planner all
 ├── plot_results.py      # Render report figures from evaluator CSV
+├── carla_bridge.py      # CARLA stretch: lazy import + connection + obstacle/pose helpers
+├── carla_controller.py  # CARLA stretch: Pure Pursuit → carla.VehicleControl adapter
+├── carla_demo.py        # CARLA stretch: end-to-end demo (--carla or --dry-run)
 ├── PROJECT_SCOPE.md     # Upgraded final-project scope and implementation plan
 ├── USER_GUIDE.md        # How to run and interact with the simulator
 ├── UPDATE.md            # Running log of major implementation updates
@@ -250,4 +253,43 @@ python evaluate.py --mode all --scenario all --planner all --output results/all.
 python evaluate.py --mode all --scenario all --sweep lane_width --planner all --output results/lane_width.csv
 python evaluate.py --planner hybrid_astar --track --output results/tracked.csv
 python plot_results.py results/all.csv
+```
+
+### CARLA stretch goal
+
+`carla_bridge.py`, `carla_controller.py`, and `carla_demo.py` wire the same
+Hybrid A* + Reeds-Shepp planner and Pure Pursuit controller into a live CARLA
+server. The architecture is:
+
+- `carla_bridge.py` lazy-imports `carla`, owns the client/world lifecycle, and
+  converts CARLA world coordinates to our planner frame. It exposes helpers
+  for actor → obstacle Rect extraction and (optionally) LiDAR → occupancy
+  voxel extraction.
+- `carla_controller.py` is a Pure Pursuit controller whose output is a
+  `ControlCommand` dataclass (steer, throttle, brake, reverse). A tiny
+  adapter wraps it into a real `carla.VehicleControl` when needed.
+- `carla_demo.py` ties the pipeline together:
+  - `--dry-run` (default) runs the entire pipeline against our internal
+    bicycle integrator — verifies wiring without needing CARLA.
+  - `--carla` connects to a live server (`--host`, `--port`, `--town`),
+    spawns the ego, extracts obstacles in a 25 m radius, plans, and drives.
+  - `--probe` reports whether `carla` is importable.
+
+Install CARLA (matching your Python version):
+
+```bash
+pip install carla        # version must match your CARLA server
+```
+
+Run end-to-end against a live server:
+
+```bash
+python carla_demo.py --carla --host localhost --port 2000 --mode perpendicular
+```
+
+Or run the dry-run pipeline (no CARLA needed):
+
+```bash
+python carla_demo.py --dry-run --mode parallel
+python carla_demo.py --dry-run --mode perpendicular --scenario parked_cars
 ```

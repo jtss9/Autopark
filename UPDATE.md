@@ -141,6 +141,79 @@ approaches that warm-start the policy from Hybrid A* solutions.
 
 ---
 
+## 2026-05-29 — CARLA stretch goal: bridge, controller adapter, dry-run demo
+
+Implemented Stage 7 from `PROJECT_SCOPE.md`. Architecture:
+
+- **`carla_bridge.py`** — lazy-imports `carla` so the rest of the project
+  still works without it. Exposes:
+  - `CARLA_AVAILABLE`, `require_carla()`
+  - `LocalFrame` — bidirectional CARLA-world ↔ planner-frame transform
+    handling the handedness flip and lane yaw alignment.
+  - `CarlaConnection` — context manager with synchronous-mode tick lifecycle.
+  - `spawn_ego`, `pose_from_actor`, `car_config_from_vehicle`.
+  - `extract_static_obstacles(world, ego_xy, radius, frame, ignore_ids)` —
+    walks `world.get_actors()` (vehicles + static props), converts bounding
+    boxes into `Rect[]` in the planner frame, ignores the ego.
+  - `occupancy_from_lidar(points, frame, ...)` — voxelises a LiDAR cloud
+    into `Rect[]` for sensor-realistic experiments.
+- **`carla_controller.py`** — Pure Pursuit controller that consumes
+  `(pose, speed, dt)` per tick and emits a `ControlCommand` dataclass
+  (`steer ∈ [-1,1]`, `throttle ∈ [0,1]`, `brake ∈ [0,1]`, `reverse: bool`).
+  Tiny `control_to_carla(cmd)` adapter wraps it into a real
+  `carla.VehicleControl` only when CARLA is importable. The controller
+  handles gear-segment transitions automatically: at each cusp it holds the
+  brake for `cusp_brake_duration_s` (1.2 s) before engaging the new gear.
+  Added overshoot detection so a fast-moving vehicle that glides past the
+  segment endpoint still triggers the gear transition.
+- **`carla_demo.py`** — end-to-end CLI:
+  - `--probe` — print whether `carla` is importable.
+  - `--dry-run` (default) — run the full pipeline against our internal
+    bicycle integrator with realistic throttle/brake/decel dynamics. Lets
+    the bridge wiring be exercised end-to-end in environments without
+    CARLA. **This is what was verified in this push.**
+  - `--carla --host --port --town` — connect to a live server, spawn the
+    ego near the spectator, extract obstacles in a 25 m radius, plan with
+    Hybrid A* + RS, drive via `apply_control()` until done or timeout.
+
+### Dry-run results in this sandbox
+
+```
+carla_demo: planner_ok=True planning_time=1.00s wp=20 |
+            executed_ok=True steps=715
+            final_err=0.016m heading_err=28.02deg
+            mean_cte=0.404m max_cte=2.552m
+```
+
+Perpendicular clear, parallel clear, and perpendicular + parked_cars all
+return `executed_ok=True` with sub-50 cm position error. Heading error and
+CTE are higher than the kinematic `tracker.py` baseline (mean CTE 0.02 m vs
+0.40 m here) because the dry-run integrator includes throttle/brake
+dynamics — the same actuator interface CARLA uses. On a live CARLA server
+the controller gains would be tuned to the actual vehicle dynamics; the
+point of `--dry-run` is to verify the pipeline wiring without needing the
+server.
+
+### Docs
+
+- `README.md` — added module entries and a CARLA stretch-goal section with
+  install / run commands.
+- `USER_GUIDE.md` — added §11 covering install, dry-run verification, live
+  run procedure, and known limitations.
+
+### Not in scope this push
+
+- LiDAR-based occupancy is implemented in the bridge but not wired into the
+  default demo loop (the actor-based path is faster and matches our
+  scenario rectangles directly).
+- The bridge does not pull parking-spot transforms from a map annotation;
+  the operator positions the spectator on the spot before launching.
+- A live CARLA run was not performed in this sandbox because the
+  environment has no CARLA installation; the bridge has been compile-checked,
+  probe-checked, and dry-run-checked end-to-end.
+
+---
+
 ## 2026-05-29 — Report figures generated, USER_GUIDE refreshed
 
 ### Report figures committed (`results/figures/`)

@@ -320,7 +320,98 @@ Summary of headline results from the default run (`results/main.csv`):
 - There is no CARLA integration yet.
 - The baseline MPC planner depends on SciPy.
 
-## 11. Suggested Next Improvements
+## 11. CARLA Stretch Goal
+
+The same Hybrid A* + Reeds-Shepp planner and Pure Pursuit controller can be
+driven against a live CARLA server. Three modules cooperate:
+
+- `carla_bridge.py` — lazy-imports `carla`, owns the client/world lifecycle,
+  converts CARLA world coordinates to our planner frame, and extracts nearby
+  obstacles from `world.get_actors()` (vehicles, static props). A LiDAR-based
+  occupancy helper is also available.
+- `carla_controller.py` — Pure Pursuit controller that emits a
+  `ControlCommand` (steer ∈ [-1, 1], throttle ∈ [0, 1], brake ∈ [0, 1],
+  `reverse: bool`). A small `control_to_carla()` adapter wraps it into a real
+  `carla.VehicleControl` only when CARLA is importable.
+- `carla_demo.py` — end-to-end CLI:
+  - `--probe` prints whether `carla` is importable.
+  - `--dry-run` (default) runs the full pipeline against our internal
+    bicycle integrator so the bridge wiring is verifiable without CARLA.
+  - `--carla --host <h> --port <p> --town <map>` runs on a live server:
+    spawn the ego near the spectator, extract obstacles in a 25 m radius,
+    plan, then drive via `apply_control()` until the controller reports done
+    or `--max_seconds` elapses.
+
+### Install (workstation with CARLA)
+
+```bash
+# Install matching wheel for your CARLA server version, e.g.:
+pip install carla
+```
+
+The `carla` PythonAPI typically requires Python 3.7–3.10. Our planner and
+controller are pure Python ≥ 3.9; running the bridge needs the older Python
+that matches your CARLA install.
+
+### Dry-run verification
+
+This sandbox does not have CARLA, so the dry-run path is what was tested:
+
+```bash
+python carla_demo.py --probe
+# CARLA_AVAILABLE=False
+
+python carla_demo.py --dry-run --mode perpendicular
+# planner_ok=True planning_time=1.0s wp=20 | executed_ok=True
+# final_err=0.02m heading_err=28deg mean_cte=0.40m
+
+python carla_demo.py --dry-run --mode parallel
+python carla_demo.py --dry-run --mode perpendicular --scenario parked_cars
+```
+
+The dry-run integrator includes throttle/brake/rolling-decel dynamics, so the
+controller's tracking error is higher than the kinematic-only `tracker.py`
+demo. This is expected — the dry-run exercises the actuator-style API
+(`steer/throttle/brake/reverse`) that CARLA uses; the kinematic tracker is the
+optimistic upper-bound case.
+
+### Live run
+
+```bash
+python carla_demo.py --carla --host localhost --port 2000 --mode perpendicular
+```
+
+Before running, position the CARLA spectator on the desired parking spot
+(its location + yaw are used as the planner-frame origin). The demo:
+
+1. Connects to the server in synchronous mode (`fixed_delta_seconds=0.05`).
+2. Spawns a Tesla Model 3 (`vehicle.tesla.model3`) at `spot_offset_xy` from
+   the spectator.
+3. Reads the ego's bounding box to fill `CarConfig` (length / width /
+   wheelbase).
+4. Calls `extract_static_obstacles(world, ..., radius_m=25, frame=...)` to
+   pull nearby vehicles and static props into our `Rect[]` format.
+5. Runs Hybrid A* + Reeds-Shepp on the obstacle set and the chosen mode.
+6. Drives the planned path via `CarlaPurePursuitController` until the
+   controller reports done.
+7. Reports planning time, executed pose error, mean / max cross-track error.
+
+### Known limitations
+
+- The bridge assumes a roughly axis-aligned parking spot in the spectator
+  frame. For arbitrary spot orientations, set `LocalFrame.yaw_offset_deg`
+  before extracting obstacles.
+- Obstacle bounding boxes are over-approximated as `max(extent.x, extent.y)`
+  squares so yaw-rotated vehicles are conservatively covered. The planner's
+  full car-rectangle collision check absorbs the slight over-conservatism.
+- LiDAR-based occupancy (`occupancy_from_lidar`) is implemented but not
+  wired into the default demo loop; it's intended for sensor-realistic
+  experiments where you want to *not* rely on ground-truth actor poses.
+- Controller gains in `ControlConfig` are tuned for slow parking; the live
+  CARLA car may need wheelbase-specific re-tuning of throttle_kp, brake_kp,
+  and lookahead.
+
+## 12. Suggested Next Improvements
 
 - Add CCSC / CCSCC Reeds-Shepp words for marginally shorter terminal arcs.
 - Function-approximation RL (DQN / PPO) with a small CNN over the local

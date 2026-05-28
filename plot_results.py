@@ -91,7 +91,7 @@ def plot_planning_time(rows, outpath: Path) -> None:
         for p in planners
     ]
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.boxplot(data, labels=planners, showmeans=True)
+    ax.boxplot(data, tick_labels=planners, showmeans=True)
     ax.set_ylabel("Planning time (s)")
     ax.set_title("Planning time distribution by planner")
     fig.tight_layout()
@@ -135,24 +135,31 @@ def plot_sweep(
     metric_label: str,
     outpath: Path,
 ) -> None:
+    """Aggregate per (planner, x) value: mean line, individual points scattered."""
     import matplotlib.pyplot as plt
-    series: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    series: Dict[str, Dict[float, List[float]]] = defaultdict(lambda: defaultdict(list))
     for r in rows:
         if r.get("sweep") != sweep_key:
             continue
         x = _parse_float(r.get(sweep_key, ""))
         y = _parse_float(r.get(metric, ""))
-        if x != x or y != y:  # nan
+        if x != x or y != y:
             continue
-        series[r.get("planner", "?")].append((x, y))
+        series[r.get("planner", "?")][x].append(y)
     if not series:
         return
+
     fig, ax = plt.subplots(figsize=(6, 4))
-    for planner, pts in sorted(series.items()):
-        pts.sort()
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        ax.plot(xs, ys, marker="o", label=planner)
+    colors = ["#2563eb", "#16a34a", "#f59e0b", "#9333ea"]
+    for ci, (planner, xy) in enumerate(sorted(series.items())):
+        color = colors[ci % len(colors)]
+        xs_sorted = sorted(xy.keys())
+        means = [sum(xy[x]) / len(xy[x]) for x in xs_sorted]
+        ax.plot(xs_sorted, means, marker="o", color=color, label=f"{planner} (mean)")
+        # Scatter individual samples lightly
+        for x in xs_sorted:
+            for y in xy[x]:
+                ax.scatter([x], [y], color=color, alpha=0.25, s=18)
     ax.set_xlabel(sweep_key)
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} vs {sweep_key}")
@@ -189,10 +196,10 @@ def plot_tracking_error(rows, outpath: Path) -> None:
     if not have_tracker:
         return
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].boxplot(data_mean, labels=planners, showmeans=True)
+    axes[0].boxplot(data_mean, tick_labels=planners, showmeans=True)
     axes[0].set_ylabel("Mean cross-track error (m)")
     axes[0].set_title("Pure-Pursuit tracking: mean CTE")
-    axes[1].boxplot(data_max, labels=planners, showmeans=True)
+    axes[1].boxplot(data_max, tick_labels=planners, showmeans=True)
     axes[1].set_ylabel("Max cross-track error (m)")
     axes[1].set_title("Pure-Pursuit tracking: max CTE")
     fig.tight_layout()

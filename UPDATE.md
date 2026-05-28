@@ -139,6 +139,44 @@ approaches that warm-start the policy from Hybrid A* solutions.
   succeeded with `used_analytic_shot=True` and tracker reached spot with
   ~7 cm executed error; Q-learn cleanly reported its rollout failure).
 
+---
+
+## 2026-05-29 — Report figures generated, USER_GUIDE refreshed
+
+### Report figures committed (`results/figures/`)
+
+- Installed matplotlib in the conda base env.
+- Ran the full evaluator matrix with tracker:
+  `python evaluate.py --mode all --scenario all --planner all --track --output results/main.csv`
+  → 30 rows, summary: Hybrid A* 90 % success, baseline 10 % (SciPy now
+  installed in base, so the single-step MPC on the wide-lane perpendicular
+  clear case actually runs), Q-learning 0 % (expected).
+- Ran lane-width and car-size sweeps:
+  - `--sweep lane_width --planner hybrid_astar`: 50 rows, 84 % success.
+  - `--sweep car_size --planner all` (perpendicular only): 60 rows.
+- Polished `plot_results.py` to use `tick_labels=` (matplotlib ≥ 3.9) and
+  changed sweep plots to aggregate per `(planner, x)`: mean line + scatter
+  cloud, instead of the original zig-zag connect-in-CSV-order.
+- Committed PNGs under `results/figures/` and added `results/*.csv` to
+  `.gitignore` so the CSVs are reproducible but not in version control.
+
+### USER_GUIDE refresh
+
+`USER_GUIDE.md` rewritten end-to-end. New sections / changes:
+
+- Setup now mentions `pip install matplotlib`.
+- Settings UI documents the new Q-learning planner.
+- Simulation controls table adds `G` (grid overlay) and `T` (executed-path
+  overlay).
+- New §6 describing the Pure Pursuit tracker, the reverse-steering-sign
+  pitfall, and tracker metrics.
+- §7 enumerates the unified metrics dict (Hybrid A*, Q-learn, tracker).
+- New §8 documenting `plot_results.py` outputs and a worked end-to-end
+  example matching the figures in `results/figures/`.
+- Recommended demo flow updated to walk through perpendicular MPC →
+  perpendicular Hybrid A* → parked-cars obstacle → parallel → Q-learning,
+  then re-running with `AUTOPARK_TRACK=1` and regenerating the figures.
+
 ### Known limitations / next steps
 
 - Tabular Q-learning does not converge to a fully-in-spot rollout on the

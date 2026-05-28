@@ -1,13 +1,17 @@
 # Smart Parking Simulator
 
-A top-down 2D parking simulation built for the *Introduction to Smart Cars* course final project.  
-Configure road and vehicle dimensions, then watch the car automatically execute a parking maneuver guided by an MPC controller.
+A top-down 2D parking simulation built for the *Introduction to Smart Cars*
+course final project. Configure road and vehicle dimensions, pick a parking
+mode (perpendicular / parallel), a scenario (clear / entry-blocker / pillar /
+parked-cars / tight-lane) and a planner (geometric MPC baseline / Hybrid A* with
+Reeds-Shepp analytic shot / tabular Q-learning), then watch the car execute
+the maneuver. Optionally turn on the Pure Pursuit closed-loop tracker to see
+the executed (control-tracked) trajectory laid against the planned one.
 
-The current MPC arc planner is the baseline. The project is being extended
-toward a map-based autonomous parking stack with Hybrid A* planning; see
-`PROJECT_SCOPE.md`.
-
-For operating instructions, see `USER_GUIDE.md`.
+The project is framed as a map-based autonomous parking stack; see
+`PROJECT_SCOPE.md` for the full target architecture. For day-to-day operation,
+see `USER_GUIDE.md`. Major in-progress work and design decisions are recorded
+in `UPDATE.md`.
 
 ---
 
@@ -35,17 +39,26 @@ cd path/to/final
 python main.py
 ```
 
-To try the initial Hybrid A* planner in the simulator:
+To pick a planner via environment variable (overrides the Settings UI choice):
 
 ```bash
 AUTOPARK_PLANNER=hybrid_astar python main.py
+AUTOPARK_PLANNER=qlearn python main.py
+```
+
+To overlay the Pure Pursuit closed-loop tracker:
+
+```bash
+AUTOPARK_TRACK=1 AUTOPARK_PLANNER=hybrid_astar python main.py
 ```
 
 To run batch evaluation metrics:
 
 ```bash
-python evaluate.py
-python evaluate.py --mode all --scenario all --planner hybrid_astar --output results/demo.csv
+python evaluate.py                                  # default sweep
+python evaluate.py --mode all --scenario all --planner all --output results/all.csv
+python evaluate.py --planner hybrid_astar --track --output results/tracked.csv
+python plot_results.py results/all.csv              # writes PNGs to results/figures/
 ```
 
 ---
@@ -77,7 +90,8 @@ Adjust all parameters using the sliders on the left. The preview canvas on the r
 **Planner**
 - **Single-step MPC** — tracks a pre-computed geometric arc; succeeds in wider lanes, fails with COLLISION in narrow ones
 - **Multi-step MPC** — uses alternating reverse/correction attempts; extends the feasibility boundary into narrower lanes where single-step fails
-- **Hybrid A*** — map-based planner for perpendicular, parallel, and obstacle-aware scenarios
+- **Hybrid A*** — map-based planner with Reeds-Shepp analytic shot for perpendicular, parallel, and obstacle-aware scenarios
+- **Q-learning (RL)** — tabular Q-learning agent with reverse-curriculum training over a discretized (x, y, θ) grid; included as a learned-policy comparison baseline
 
 If the car is too large for the spot, the spot outline turns red and simulation is blocked until dimensions are corrected.
 
@@ -91,6 +105,8 @@ Animates the full parking trajectory computed by the selected planner.
 |---|---|
 | `SPACE` | Pause / resume |
 | `R` | Restart animation |
+| `G` | Toggle occupancy-grid overlay |
+| `T` | Toggle executed (closed-loop) path overlay |
 | `S` | Return to settings (preserves last slider values) |
 | `ESC` / `Q` | Quit |
 
@@ -113,13 +129,18 @@ final/
 ├── parking_lot.py       # World-space geometry (lane, spot, car corners)
 ├── scenarios.py         # Static obstacle scenarios
 ├── settings_window.py   # Phase 1: tkinter settings UI with live preview
-├── trajectory.py        # Trajectory planner (geometric reference + MPC)
-├── hybrid_astar.py      # Initial occupancy-grid Hybrid A* planner
+├── trajectory.py        # Trajectory planner dispatch + result/tracker glue
+├── hybrid_astar.py      # Hybrid A* planner over (x, y, θ) with Reeds-Shepp shot
+├── reeds_shepp.py       # Reeds-Shepp shortest-path generator (CSC + CCC, full RS via symmetries)
+├── tracker.py           # Pure Pursuit closed-loop tracker with gear-aware cusps
+├── rl_qlearn.py         # Tabular Q-learning planner with reverse curriculum
 ├── controller.py        # Bicycle kinematic model and MPC controller
 ├── simulation.py        # Phase 2: pygame animation loop
-├── evaluate.py          # Batch CSV evaluation runner
+├── evaluate.py          # Batch CSV evaluation runner with --track and --planner all
+├── plot_results.py      # Render report figures from evaluator CSV
 ├── PROJECT_SCOPE.md     # Upgraded final-project scope and implementation plan
 ├── USER_GUIDE.md        # How to run and interact with the simulator
+├── UPDATE.md            # Running log of major implementation updates
 └── requirements.txt
 ```
 
@@ -162,22 +183,71 @@ max_steer_angle = 35°
 R_min           = wheelbase / tan(max_steer_angle)  ≈ 3–5 m
 ```
 
-The new Hybrid A* path is opt-in with `AUTOPARK_PLANNER=hybrid_astar`. It
-searches over `(x, y, theta)` using forward/reverse bicycle-model motion
-primitives and validates every candidate pose with full car-corner collision
-checking.
+### Hybrid A* with Reeds-Shepp analytic shot
 
-Parallel parking now uses Hybrid A* by default because the old geometric/MPC
-baseline only supports perpendicular parking.
+The Hybrid A* planner (`hybrid_astar.py`) searches over `(x, y, θ)` using
+forward/reverse bicycle-model motion primitives and validates every candidate
+pose with full car-corner collision checking against the lane, spot, and
+obstacle rectangles. Three upgrades over a plain Hybrid A*:
 
-Hybrid A* reports metrics including planning time, expanded states, raw and
-smoothed path length, waypoint count, final position/heading error, obstacle
-count, and whether the final vehicle rectangle is fully inside the parking spot.
+- **Reeds-Shepp analytic shot.** At every popped node within a configurable
+  radius (and periodically when farther away), the planner tries a closed-form
+  Reeds-Shepp curve from the current pose directly to the goal. If the curve
+  is collision-free and lands the car fully inside the spot, it is accepted as
+  the path tail and the search terminates. This is the classical Dolgov et al.
+  (2008) trick that dramatically reduces search effort and produces smooth,
+  vehicle-feasible terminal maneuvers.
+- **RS-based non-holonomic heuristic.** Within the same radius, the heuristic
+  combines the standard Euclidean + heading term with the Reeds-Shepp path
+  length, cached on a coarse `(Δx, Δy, Δθ)` grid for amortised O(1) lookup.
+- **Lightweight smoothing.** Near-duplicate and nearly collinear waypoints are
+  removed while preserving the first and final pose and rejecting any cleanup
+  segment that collides or leaves valid bounds.
 
-`evaluate.py` is the report-facing CLI. Useful examples:
+### Pure Pursuit closed-loop tracker
+
+`tracker.py` splits the planned path into single-gear segments (cusps detected
+by the sign of the heading-projected motion) and runs a standard Pure Pursuit
+controller on each segment under the same kinematic bicycle model. The reverse
+segments flip both the lookahead frame and the steering sign — without that
+sign flip the agent drives away from the path because
+`θ̇ = v·tan(δ)/L` inverts with `v`. Output metrics include cusp count, mean
+and max cross-track error, executed-final position/heading error, and whether
+the executed (control-tracked) pose ends fully inside the spot.
+
+### Tabular Q-learning RL planner
+
+`rl_qlearn.py` discretizes the rear-axle state into `(ix, iy, ith)` buckets,
+exposes 10 discrete `(gear × steering)` actions, and trains a tabular Q
+function with ε-greedy exploration, potential-based shaping on distance and
+heading, and a large terminal bonus when the car is fully inside the spot.
+A **reverse-curriculum** schedule samples episode starts near the goal early
+in training and expands outward as training progresses. The greedy rollout is
+returned as the "planned" path. It is intentionally included as a *learned
+baseline*; on this continuous SE(2) problem with sparse rewards, tabular Q
+typically fails to converge in a few seconds of training, which is itself a
+useful comparison point against the search-based and classical-control
+methods.
+
+### Metrics
+
+Each planner returns a uniform metrics dictionary: `planning_time_s`,
+`iterations`, `expanded_states`, `path_length_m` (raw + smoothed where
+applicable), `waypoints`, `final_pos_error_m`, `final_heading_error_deg`,
+`fully_in_spot`, `obstacles`. Hybrid A* additionally reports
+`rs_shot_attempts/successes` and `used_analytic_shot`. Q-learning adds
+`training_time_s`, `successful_episodes`, `episodes`. When the tracker is
+enabled the result also carries `mean_cte_m`, `max_cte_m`, `cusps`,
+`exec_final_pos_error_m`, `exec_fully_in_spot`.
+
+`evaluate.py` writes a stable CSV with every column above and is the
+report-facing CLI:
 
 ```bash
 python evaluate.py
 python evaluate.py --mode parallel --scenario all --planner hybrid_astar
-python evaluate.py --mode all --scenario all --sweep lane_width --planner hybrid_astar --output results/lane_width.csv
+python evaluate.py --mode all --scenario all --planner all --output results/all.csv
+python evaluate.py --mode all --scenario all --sweep lane_width --planner all --output results/lane_width.csv
+python evaluate.py --planner hybrid_astar --track --output results/tracked.csv
+python plot_results.py results/all.csv
 ```

@@ -32,29 +32,83 @@ class TrajectoryResult:
     phase_starts: List[int] = field(default_factory=list)
     phase_names:  List[str] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    executed_waypoints: List[Waypoint] = field(default_factory=list)
+    tracking_metrics: dict = field(default_factory=dict)
 
 
 def plan_trajectory(
     pc: ParkingConfig,
     cc: CarConfig,
     planner: str = "baseline",
+    track: bool = False,
 ) -> TrajectoryResult:
-    if planner == "hybrid_astar" or pc.planner == "hybrid_astar":
+    if planner == "qlearn" or pc.planner == "qlearn":
+        from rl_qlearn import plan_qlearn
+        result = plan_qlearn(pc, cc)
+    elif planner == "hybrid_astar" or pc.planner == "hybrid_astar":
         from hybrid_astar import plan_hybrid_astar
-        return plan_hybrid_astar(pc, cc)
-
-    if pc.obstacle_scenario != "none":
+        result = plan_hybrid_astar(pc, cc)
+    elif pc.obstacle_scenario != "none":
         from hybrid_astar import plan_hybrid_astar
-        return plan_hybrid_astar(pc, cc)
-
-    if pc.parking_type == "perpendicular":
+        result = plan_hybrid_astar(pc, cc)
+    elif pc.parking_type == "perpendicular":
         if pc.planner == "multi":
-            return _plan_perpendicular_multistep(pc, cc)
-        return _plan_perpendicular_mpc(pc, cc)
-    if pc.parking_type == "parallel":
+            result = _plan_perpendicular_multistep(pc, cc)
+        else:
+            result = _plan_perpendicular_mpc(pc, cc)
+    elif pc.parking_type == "parallel":
         from hybrid_astar import plan_hybrid_astar
-        return plan_hybrid_astar(pc, cc)
-    return TrajectoryResult([], False, f"Unknown parking type: {pc.parking_type}")
+        result = plan_hybrid_astar(pc, cc)
+    else:
+        return TrajectoryResult([], False, f"Unknown parking type: {pc.parking_type}")
+
+    if track and result.feasible and len(result.waypoints) >= 2:
+        _attach_tracker(pc, cc, result)
+    return result
+
+
+def _attach_tracker(
+    pc: ParkingConfig,
+    cc: CarConfig,
+    result: TrajectoryResult,
+) -> None:
+    """Run a Pure Pursuit closed-loop tracker on the planned path."""
+    from tracker import track_path
+    lot = ParkingLot(pc, cc)
+    dense = _densify_for_tracking(result.waypoints, max_step=0.15)
+    tr = track_path(dense, cc, lot)
+    result.executed_waypoints = tr.executed
+    result.tracking_metrics = {
+        "tracker": "pure_pursuit",
+        "tracker_success": tr.succeeded,
+        "tracker_message": tr.message,
+        "mean_cte_m": tr.mean_cte_m,
+        "max_cte_m": tr.max_cte_m,
+        "exec_final_pos_error_m": tr.final_pos_error_m,
+        "exec_final_heading_error_deg": tr.final_heading_error_deg,
+        "exec_fully_in_spot": tr.fully_in_spot,
+        "cusps": tr.cusps,
+    }
+
+
+def _densify_for_tracking(
+    waypoints: List[Waypoint],
+    max_step: float = 0.15,
+) -> List[Waypoint]:
+    """Insert intermediate samples so consecutive waypoints stay within max_step."""
+    if len(waypoints) < 2:
+        return list(waypoints)
+    out: List[Waypoint] = [waypoints[0]]
+    for a, b in zip(waypoints, waypoints[1:]):
+        dx = b.x - a.x
+        dy = b.y - a.y
+        dist = math.hypot(dx, dy)
+        n = max(1, int(math.ceil(dist / max_step)))
+        for k in range(1, n + 1):
+            t = k / n
+            theta = a.theta + _angle_diff(b.theta, a.theta) * t
+            out.append(Waypoint(a.x + dx * t, a.y + dy * t, theta))
+    return out
 
 
 def _angle_diff(a: float, b: float) -> float:

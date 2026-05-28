@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from config import CarConfig, ParkingConfig
 from parking_lot import ParkingLot, Rect
+import reeds_shepp
 from scenarios import obstacles_for
 from trajectory import TrajectoryResult, Waypoint
 
@@ -157,8 +158,28 @@ class HybridAStarPlanner:
             self.cc.max_steer,
         )
 
+        # Reeds-Shepp analytic shot: try once every N expansions and
+        # always when the node is close enough to the goal.
+        self.rs_radius = max(self.cc.min_turn_radius, 0.5)
+        self.rs_step = 0.12
+        self.rs_shot_interval = 50
+        self.rs_shot_radius = 4.5  # try unconditionally inside this distance
+
+        # Diagnostic counters populated by plan()
+        self.rs_shot_attempts = 0
+        self.rs_shot_successes = 0
+
+        # Cache RS-heuristic values on a coarse (xy,theta) grid to avoid
+        # recomputing the same RS path for every popped node.
+        self._heuristic_cache: Dict[Tuple[int, int, int], float] = {}
+        self._heuristic_xy = 0.3
+        self._heuristic_theta_bins = 24
+
     def plan(self, start: Pose, goal: Pose) -> TrajectoryResult:
         start_t = time.perf_counter()
+        self.rs_shot_attempts = 0
+        self.rs_shot_successes = 0
+        self._heuristic_cache.clear()
         if not self.grid.pose_is_valid(start):
             return TrajectoryResult([], False, "Hybrid A*: start pose is invalid.")
         if not self.grid.pose_is_valid(goal):
@@ -184,8 +205,9 @@ class HybridAStarPlanner:
                 continue
             closed.add(current_idx)
             current = nodes[current_idx]
+            current_pose: Pose = (current.x, current.y, current.theta)
 
-            if self._reached_goal((current.x, current.y, current.theta), goal):
+            if self._reached_goal(current_pose, goal):
                 raw_wps = self._reconstruct(current_idx, nodes)
                 wps = self._smooth_path(raw_wps)
                 elapsed = time.perf_counter() - start_t
@@ -203,6 +225,33 @@ class HybridAStarPlanner:
                     f"Hybrid A*: OK in {elapsed:.2f}s, {iterations} iterations.",
                     [0],
                     ["Hybrid A* parking"],
+                    metrics,
+                )
+
+            shot = self._try_rs_shot(current_pose, goal, iterations)
+            if shot is not None:
+                base_wps = self._reconstruct(current_idx, nodes)
+                merged = self._merge_shot(base_wps, shot)
+                wps = self._smooth_path(merged)
+                elapsed = time.perf_counter() - start_t
+                metrics = self._metrics(
+                    wps,
+                    goal,
+                    elapsed,
+                    iterations,
+                    len(nodes),
+                    merged,
+                )
+                metrics["rs_shot_attempts"] = self.rs_shot_attempts
+                metrics["rs_shot_successes"] = self.rs_shot_successes
+                metrics["used_analytic_shot"] = True
+                return TrajectoryResult(
+                    wps,
+                    True,
+                    f"Hybrid A*+RS: OK in {elapsed:.2f}s, {iterations} iterations "
+                    f"(analytic shot).",
+                    [0],
+                    ["Hybrid A* + Reeds-Shepp parking"],
                     metrics,
                 )
 
@@ -277,8 +326,73 @@ class HybridAStarPlanner:
     def _heuristic(self, pose: Pose, goal: Pose) -> float:
         dx = pose[0] - goal[0]
         dy = pose[1] - goal[1]
+        dist = math.hypot(dx, dy)
         dtheta = abs(_angle_diff(pose[2], goal[2]))
-        return math.hypot(dx, dy) + 0.4 * dtheta
+        holonomic = dist + 0.4 * dtheta
+        # Reeds-Shepp gives a non-holonomic lower bound but is expensive.
+        # Use a cached lookup on a coarse grid so each pose costs O(1)
+        # after the first RS query in its bucket.
+        if dist < self.rs_shot_radius * 1.5:
+            key = (
+                int(round((pose[0] - goal[0]) / self._heuristic_xy)),
+                int(round((pose[1] - goal[1]) / self._heuristic_xy)),
+                int(round(
+                    _angle_diff(pose[2], goal[2])
+                    / (2 * math.pi)
+                    * self._heuristic_theta_bins
+                )),
+            )
+            rs_len = self._heuristic_cache.get(key)
+            if rs_len is None:
+                rs_len = reeds_shepp.path_length(pose, goal, self.rs_radius)
+                self._heuristic_cache[key] = rs_len
+            if math.isfinite(rs_len):
+                return max(holonomic, rs_len)
+        return holonomic
+
+    def _try_rs_shot(
+        self,
+        pose: Pose,
+        goal: Pose,
+        iterations: int,
+    ) -> Optional[List[Waypoint]]:
+        dist = math.hypot(pose[0] - goal[0], pose[1] - goal[1])
+        if dist > self.rs_shot_radius:
+            if iterations % self.rs_shot_interval != 0:
+                return None
+            if dist > self.rs_shot_radius * 2.5:
+                return None
+
+        self.rs_shot_attempts += 1
+        rs_path = reeds_shepp.shortest_path(pose, goal, self.rs_radius)
+        if rs_path is None:
+            return None
+        # Cap shot length to avoid validating very long segments far from goal
+        if rs_path.length > dist + 4.0 * self.rs_radius:
+            return None
+
+        samples = reeds_shepp.discretize(pose, rs_path, self.rs_radius, step=self.rs_step)
+        for x, y, theta, _ in samples:
+            if not self.grid.pose_is_valid((x, y, theta)):
+                return None
+
+        # Final pose must satisfy the same parking acceptance criteria
+        final = samples[-1]
+        if not self.grid.pose_is_fully_in_spot((final[0], final[1], final[2])):
+            return None
+
+        self.rs_shot_successes += 1
+        return [Waypoint(x, y, theta) for x, y, theta, _ in samples]
+
+    def _merge_shot(
+        self,
+        base_path: List[Waypoint],
+        shot: List[Waypoint],
+    ) -> List[Waypoint]:
+        if not base_path:
+            return list(shot)
+        # The shot starts at the last base waypoint; skip its first sample.
+        return list(base_path) + list(shot[1:])
 
     def _reached_goal(self, pose: Pose, goal: Pose) -> bool:
         dist = math.hypot(pose[0] - goal[0], pose[1] - goal[1])

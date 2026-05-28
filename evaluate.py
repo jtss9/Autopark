@@ -49,6 +49,17 @@ FIELDNAMES = [
     "final_heading_error_deg",
     "fully_in_spot",
     "obstacles",
+    "rs_shot_attempts",
+    "rs_shot_successes",
+    "used_analytic_shot",
+    "tracker_success",
+    "mean_cte_m",
+    "max_cte_m",
+    "exec_final_pos_error_m",
+    "exec_fully_in_spot",
+    "cusps",
+    "training_time_s",
+    "successful_episodes",
 ]
 
 MODE_CHOICES = ("perpendicular", "parallel", "all")
@@ -60,7 +71,7 @@ SCENARIO_CHOICES = (
     *SCENARIO_NAMES,
 )
 SWEEP_CHOICES = ("lane_width", "spot_size", "car_size", "none")
-PLANNER_CHOICES = ("baseline", "hybrid_astar", "all")
+PLANNER_CHOICES = ("baseline", "hybrid_astar", "qlearn", "all")
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -160,7 +171,22 @@ def _result_row(
         ),
         "fully_in_spot": full_spot,
         "obstacles": _metric(result, "obstacles", ""),
+        "rs_shot_attempts": _metric(result, "rs_shot_attempts"),
+        "rs_shot_successes": _metric(result, "rs_shot_successes"),
+        "used_analytic_shot": _metric(result, "used_analytic_shot"),
+        "training_time_s": _metric(result, "training_time_s"),
+        "successful_episodes": _metric(result, "successful_episodes"),
     })
+    tm = result.tracking_metrics or {}
+    if tm:
+        row.update({
+            "tracker_success": tm.get("tracker_success"),
+            "mean_cte_m": tm.get("mean_cte_m"),
+            "max_cte_m": tm.get("max_cte_m"),
+            "exec_final_pos_error_m": tm.get("exec_final_pos_error_m"),
+            "exec_fully_in_spot": tm.get("exec_fully_in_spot"),
+            "cusps": tm.get("cusps"),
+        })
     return row
 
 
@@ -194,7 +220,7 @@ def _scenarios(selected: str) -> Sequence[str]:
 
 def _planners(selected: str) -> Sequence[str]:
     if selected == "all":
-        return ("baseline", "hybrid_astar")
+        return ("baseline", "hybrid_astar", "qlearn")
     return (selected,)
 
 
@@ -248,6 +274,7 @@ def run_case(
     cc: CarConfig,
     planner: str,
     sweep: str,
+    track: bool = False,
 ) -> dict:
     if planner == "baseline":
         can_run, reason = _can_run_baseline(pc)
@@ -255,13 +282,17 @@ def run_case(
             return _skip_row(pc, cc, planner, sweep, reason)
         pc = replace(pc, planner="multi" if pc.lane_width < 4.5 else "single")
         requested_planner = "baseline"
+    elif planner == "qlearn":
+        requested_planner = "qlearn"
     else:
         requested_planner = "hybrid_astar"
 
     started = time.perf_counter()
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            result = plan_trajectory(pc, cc, planner=requested_planner)
+            result = plan_trajectory(
+                pc, cc, planner=requested_planner, track=track,
+            )
     except Exception as exc:  # keep batch evaluation resilient for reports
         return _skip_row(pc, cc, planner, sweep, f"Planner crashed: {exc}")
     elapsed = time.perf_counter() - started
@@ -276,7 +307,7 @@ def build_rows(args: argparse.Namespace) -> List[dict]:
             base_pc = _scenario_config(mode, scenario)
             for pc, cc in _sweep_configs(base_pc, base_cc, args.sweep):
                 for planner in _planners(args.planner):
-                    rows.append(run_case(pc, cc, planner, args.sweep))
+                    rows.append(run_case(pc, cc, planner, args.sweep, track=args.track))
     return rows
 
 
@@ -325,6 +356,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--sweep", choices=SWEEP_CHOICES, default="none")
     parser.add_argument("--planner", choices=PLANNER_CHOICES, default="all")
     parser.add_argument("--output", help="Write CSV rows to this path instead of stdout.")
+    parser.add_argument(
+        "--track",
+        action="store_true",
+        help="Also run the Pure Pursuit closed-loop tracker and record tracking metrics.",
+    )
     return parser.parse_args(argv)
 
 

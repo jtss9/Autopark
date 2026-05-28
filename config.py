@@ -25,4 +25,4 @@ class ParkingConfig:
     spot_width: float = 2.5
     parking_type: str = "perpendicular"  # "perpendicular" | "parallel"
     obstacle_scenario: str = "none"       # "none" | "entry_blocker" | "tight_lane" | "pillar_near_entry" | "parked_cars"
-    planner: str = "single"               # "single" | "multi" | "hybrid_astar"
+    planner: str = "single"               # "single" | "multi" | "hybrid_astar" | "qlearn"

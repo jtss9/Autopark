@@ -205,6 +205,14 @@ class SettingsWindow:
                        selectcolor=COLOR_PANEL_2,
                        font=("Arial", 11)).pack(
             side="left", padx=4)
+        tk.Radiobutton(planner_frame, text="Q-learning (RL)",
+                       variable=self.var_planner, value="qlearn",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
 
         # ---- Right panel: expandable canvas ----
         right = tk.Frame(root, bg=COLOR_PANEL, padx=10, pady=8,

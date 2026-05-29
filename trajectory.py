@@ -390,8 +390,11 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
         # ICR for a left-turn reverse maneuver starting at theta0
         icr_x = x0 - R * math.sin(theta0)
         icr_y = y0 + R * math.cos(theta0)
-        # Sweep from theta0 to -pi/2
-        arc_span = theta0 + math.pi / 2          # always > 0 for theta0 > -pi/2
+        # Sweep from theta0 to -pi/2. Clamp to >= 0 so a car already at or
+        # past -pi/2 yields a zero-length arc and falls through to the
+        # straight reverse below, instead of sweeping backwards on a
+        # degenerate 2-point reference.
+        arc_span = max(0.0, theta0 + math.pi / 2)
         n_arc = max(2, int(math.degrees(arc_span)) + 1)
         ref: List[Waypoint] = []
         for i in range(n_arc):

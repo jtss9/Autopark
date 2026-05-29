@@ -200,10 +200,10 @@ def run_dry(
     waypoints, planner_metrics = plan_parking(parking_type, cc, pc, obstacles)
     planning_time = time.perf_counter() - t0
 
-    if not waypoints:
+    if len(waypoints) < 2:
         return DemoResult(
             planner_success=False,
-            planner_message="dry-run: planner returned empty path",
+            planner_message="dry-run: planner returned no usable path",
             planning_time_s=planning_time,
             planned_waypoints=[],
             executed_poses=[],
@@ -310,10 +310,10 @@ def run_carla(
             t0 = time.perf_counter()
             waypoints, planner_metrics = plan_parking(parking_type, cc, pc, obstacles)
             planning_time = time.perf_counter() - t0
-            if not waypoints:
+            if len(waypoints) < 2:
                 return DemoResult(
                     planner_success=False,
-                    planner_message=f"CARLA: planner returned no path ({planner_metrics})",
+                    planner_message=f"CARLA: planner returned no usable path ({planner_metrics})",
                     planning_time_s=planning_time,
                     planned_waypoints=[],
                     executed_poses=[],

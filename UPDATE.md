@@ -141,6 +141,80 @@ approaches that warm-start the policy from Hybrid A* solutions.
 
 ---
 
+## 2026-05-29 — Latest results/main.csv summary
+
+Full evaluator matrix re-run end-to-end with the Pure Pursuit tracker:
+
+```bash
+python evaluate.py --mode all --scenario all --planner all --track \
+    --output results/main.csv
+# summary,rows=30,success_rate=0.333,avg_planning_time_s=4.063,
+#         avg_path_length_m=22.534,avg_final_pos_error_m=2.368,
+#         full_spot_success_rate=0.333
+```
+
+Breakdown (30 rows = 2 modes × 5 scenarios × 3 planners):
+
+### Per-planner
+
+| Planner | Success | Avg planning time |
+|---|---|---|
+| baseline (MPC) | **1 / 10 (10 %)** | 0.19 s |
+| hybrid_astar (with RS shot) | **9 / 10 (90 %)** | 2.65 s |
+| qlearn (RL) | **0 / 10 (0 %)** | 5.86 s |
+
+Baseline succeeds only on perpendicular + clear (it does not handle
+parallel parking or obstacles). Hybrid A* solves every scenario except
+perpendicular `tight_lane`, which is geometrically infeasible at the
+sweep's lane width with the default car dimensions. Q-learning hits its
+30 s training budget without converging — the same finding as the
+previous push, recorded here from a fresh seed.
+
+### Per-scenario (Hybrid A* only)
+
+| Scenario | Success |
+|---|---|
+| none              | 2 / 2 |
+| entry_blocker     | 2 / 2 |
+| tight_lane        | 1 / 2 |
+| pillar_near_entry | 2 / 2 |
+| parked_cars       | 2 / 2 |
+
+### Reeds-Shepp analytic shot
+
+Every successful Hybrid A* run (9 / 9) terminated via the Reeds-Shepp
+analytic shot rather than reaching the goal through motion-primitive
+expansion alone. Shot attempts averaged ~1,580 per run (up to 3,803 for
+the hardest parallel + parked_cars case) with exactly one accepted shot
+per success — confirming the shot is doing its job: try cheaply, accept
+once, terminate the search with a smooth vehicle-feasible tail.
+
+### Pure Pursuit closed-loop tracking
+
+Over the 9 successful Hybrid A* runs:
+
+| Metric | Average | Worst case |
+|---|---|---|
+| Mean cross-track error | **0.019 m** | 0.040 m |
+| Max cross-track error | 0.123 m | 0.486 m |
+| Executed final position error | 0.076 m | — |
+| Executed pose fully inside spot | **8 / 9** | — |
+
+The single tracker miss (`parallel + parked_cars`) reached the spot
+geometrically but with the final car body slightly straddling the spot
+boundary, which the strict full-rectangle success criterion rejects.
+
+### Headline figures (regenerated from this CSV)
+
+- `results/figures/main_success_rate.png` — 10 % / 90 % / 0 % bars.
+- `results/figures/main_planning_time.png` — refreshed wall-time
+  distribution.
+- `results/figures/main_path_length.png`, `main_tracking_error.png` —
+  byte-identical to the previous push (path geometry and tracker
+  performance are independent of wall time).
+
+---
+
 ## 2026-05-29 — CARLA stretch goal: bridge, controller adapter, dry-run demo
 
 Implemented Stage 7 from `PROJECT_SCOPE.md`. Architecture:

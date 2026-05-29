@@ -406,7 +406,11 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
         y_end = icr_y                # y at theta=-pi/2
         y = y_end + STEP
         spot_top = lot.lane_rect.top + lot.spot_rect.h
-        target_y = min(spot_top - 0.15, y_end + 1.5)
+        # Reverse straight all the way to the goal depth. The previous
+        # `min(..., y_end + 1.5)` cap stopped 1.5 m past the arc exit, which
+        # left the car ~3 m short of the goal in a deep spot (the arc exits at
+        # y_end ~= y0 + R, well below spot_top for any non-shallow spot).
+        target_y = spot_top - 0.15
         while y < target_y - STEP / 2:
             ref.append(Waypoint(x_end, y, -math.pi / 2))
             y += STEP

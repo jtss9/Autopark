@@ -150,7 +150,9 @@ def _track_segment(
             # heading is still close to the planned terminal heading; otherwise
             # report the segment as failed so all_segments_ok flips to False
             # and the tracker message reflects the real divergence.
-            seg_ok = end_heading < math.radians(cfg.segment_theta_tol_deg * 2)
+            # cfg.segment_theta_tol is already in radians; allow 2x tolerance
+            # for the overshoot bail since the geometry is necessarily looser.
+            seg_ok = end_heading < cfg.segment_theta_tol * 2
             return executed, cte_samples, (x, y, theta), seg_ok
 
     return executed, cte_samples, (x, y, theta), False

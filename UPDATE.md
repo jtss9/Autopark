@@ -141,6 +141,86 @@ approaches that warm-start the policy from Hybrid A* solutions.
 
 ---
 
+## 2026-05-29 — Post-fix demo flow rerun
+
+After landing the 15-bug fix push (commit 9115a71), re-ran the same
+evaluator and CARLA dry-runs to verify no regressions in the demo-facing
+numbers.
+
+### One regression caught and fixed
+
+`tracker.py` referenced `cfg.segment_theta_tol_deg` in the overshoot bail
+fix — but `TrackerConfig` stores `segment_theta_tol` in radians (the
+`_deg` suffix belongs to `ControlConfig`). The Hybrid A* + Pure Pursuit
+path for `parallel + parked_cars` crashed with
+`AttributeError: 'TrackerConfig' object has no attribute 'segment_theta_tol_deg'`,
+dropping the matrix success rate from 0.333 to 0.300. Fixed inline by
+using `cfg.segment_theta_tol * 2` (already radians) before the rerun.
+
+### Headline numbers (post-fix rerun)
+
+```bash
+python evaluate.py --mode all --scenario all --planner all --track \
+    --output results/main.csv
+# summary,rows=30,success_rate=0.333,avg_planning_time_s=3.853,
+#         avg_path_length_m=21.461,avg_final_pos_error_m=2.368,
+#         full_spot_success_rate=0.333
+```
+
+| Planner | Success | Notes |
+|---|---|---|
+| baseline (MPC) | **1 / 10 (10 %)** | only perpendicular + clear |
+| hybrid_astar + RS | **9 / 10 (90 %)** | only failure: perpendicular tight_lane (infeasible) |
+| qlearn (RL) | **0 / 10 (0 %)** | training plateau — expected |
+
+Hybrid A* per-scenario: none 2/2 · entry_blocker 2/2 · tight_lane 1/2 ·
+pillar_near_entry 2/2 · parked_cars 2/2.
+
+Pure Pursuit tracker on the 9 successful Hybrid A* runs:
+
+| Metric | Average | Worst case |
+|---|---|---|
+| Mean CTE | **0.019 m** | 0.040 m |
+| Max CTE | 0.123 m | 0.486 m |
+| Executed final position error | 0.076 m | — |
+| Executed final heading error | **1.57°** | — |
+| Executed pose fully inside spot | **8 / 9** | — |
+
+All identical to pre-fix on the success/CTE axes. The new
+`exec_final_heading_error_deg` column is now in every CSV (avg 1.57°).
+
+### Lane-width sweep (post-fix)
+
+```
+summary,rows=50,success_rate=0.840,avg_planning_time_s=2.321,
+        avg_path_length_m=18.103,avg_final_pos_error_m=0.001,
+        full_spot_success_rate=0.840
+```
+
+avg_path_length improved slightly (21.5 → 18.1 m) — the RS shot is
+terminating with shorter paths once L2 is floored in the controller.
+
+### CARLA dry-run (post-fix, all three modes)
+
+| Mode | Scenario | Plan time | Final err | Mean CTE | Max CTE | exec_ok |
+|---|---|---|---|---|---|---|
+| perpendicular | clear | 1.00s | 0.012m | 0.424m | 2.564m | ✓ |
+| parallel | clear | 2.79s | 0.460m | 0.178m | 0.889m | ✓ |
+| perpendicular | parked_cars | 1.17s | 0.011m | 0.505m | 2.680m | ✓ |
+
+Identical to pre-fix.
+
+### Figures refreshed
+
+`results/figures/main_planning_time.png`,
+`results/figures/main_tracking_error.png`, and the two
+`sweep_lane_width_*planning_time*.png` files now reflect the post-fix
+wall times. Success-rate and path-length figures are byte-identical to
+the previous push (those metrics don't depend on wall time and the
+decisions didn't change).
+
+---
+
 ## 2026-05-29 — Latest results/main.csv summary
 
 Full evaluator matrix re-run end-to-end with the Pure Pursuit tracker:

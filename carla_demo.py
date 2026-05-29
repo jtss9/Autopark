@@ -45,7 +45,7 @@ from carla_controller import (
     control_to_carla,
 )
 from config import CarConfig, ParkingConfig
-from geom import angle_diff as _angle_diff
+from geom import angle_diff as _angle_diff, closest_index as _closest_index
 from hybrid_astar import (
     HybridAStarPlanner,
     OccupancyGrid,
@@ -105,15 +105,6 @@ def plan_parking(
     start = lot.car_start_pose
     result = planner.plan(start, goal)
     return result.waypoints, result.metrics
-
-
-def _closest_index(planned: Sequence[Waypoint], x: float, y: float) -> int:
-    best_i, best_d = 0, float("inf")
-    for i, w in enumerate(planned):
-        d = (w.x - x) ** 2 + (w.y - y) ** 2
-        if d < best_d:
-            best_d, best_i = d, i
-    return best_i
 
 
 def _cte(planned: Sequence[Waypoint], x: float, y: float) -> float:

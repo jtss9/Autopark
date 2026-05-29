@@ -16,7 +16,12 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from config import CarConfig
-from geom import angle_diff as _angle_diff, split_by_gear as _split_by_gear
+from geom import (
+    PURE_PURSUIT_L2_FLOOR as _L2_FLOOR,
+    angle_diff as _angle_diff,
+    closest_index as _closest_index,
+    split_by_gear as _split_by_gear,
+)
 from parking_lot import ParkingLot
 from trajectory import Waypoint
 
@@ -63,17 +68,6 @@ def _cross_track_error(
     return abs((b.x - a.x) * (a.y - y) - (a.x - x) * (b.y - a.y)) / seg_len
 
 
-def _closest_index(seg: Sequence[Waypoint], x: float, y: float, start: int) -> int:
-    end = min(len(seg), start + 40)
-    best_i, best_d = start, float("inf")
-    for i in range(start, end):
-        wp = seg[i]
-        d = (wp.x - x) ** 2 + (wp.y - y) ** 2
-        if d < best_d:
-            best_d, best_i = d, i
-    return best_i
-
-
 def _track_segment(
     seg: Sequence[Waypoint],
     gear: int,
@@ -92,7 +86,7 @@ def _track_segment(
     idx = 0
     last_idx = len(seg) - 1
     for _ in range(cfg.max_steps_per_segment):
-        idx = _closest_index(seg, x, y, idx)
+        idx = _closest_index(seg, x, y, idx, window=40)
 
         # Pick a lookahead target ahead along the segment by arc length Ld.
         target_i = idx
@@ -124,7 +118,7 @@ def _track_segment(
         # saturates the wheel for one tick. The floor caps the implied
         # |curvature| at 2/min_ld; at min_ld = 0.05 m that allows up to
         # 40 m^-1, well above any physical maneuver but smooth.
-        L2 = max(L2, 0.0025)  # 0.05 m floor
+        L2 = max(L2, _L2_FLOOR)
         curvature = 2.0 * ly / L2
         delta = math.atan(cc.wheelbase * curvature)
         if gear < 0:

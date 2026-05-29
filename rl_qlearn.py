@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from config import CarConfig, ParkingConfig
-from geom import angle_diff as _angle_diff
+from geom import angle_diff as _angle_diff, path_length as _path_length
 from hybrid_astar import (
     OccupancyGrid,
     parallel_goal_pose,
@@ -318,9 +318,7 @@ def plan_qlearn(
     final = path[-1] if path else Waypoint(*lot.car_start_pose)
     final_pos_error = math.hypot(final.x - goal[0], final.y - goal[1])
     final_heading_error = abs(_angle_diff(final.theta, goal[2]))
-    path_length = sum(
-        math.hypot(b.x - a.x, b.y - a.y) for a, b in zip(path, path[1:])
-    )
+    path_length = _path_length(path)
     fully_in_spot = grid.pose_is_fully_in_spot((final.x, final.y, final.theta), margin=0.0)
     success = ok and fully_in_spot
     final_message = message

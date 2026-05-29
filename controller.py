@@ -13,6 +13,7 @@ import numpy as np
 from scipy.optimize import minimize
 
 from config import CarConfig
+from geom import angle_diff as _angle_diff
 from parking_lot import ParkingLot
 
 
@@ -130,7 +131,7 @@ class MPCController:
             for d in deltas:
                 cx, cy, cth = self._step(cx, cy, cth, v, d)
                 total += self.w_pos * ((cx - tgt.x) ** 2 + (cy - tgt.y) ** 2)
-                dh = (cth - tgt.theta + math.pi) % (2 * math.pi) - math.pi
+                dh = _angle_diff(cth, tgt.theta)
                 total += self.w_heading * dh ** 2
                 total += self.w_delta   * d ** 2
                 total += self.w_ddelta  * (d - pd) ** 2
@@ -153,7 +154,7 @@ class MPCController:
             total = 0.0
             for d in deltas:
                 cx, cy, cth = self._step(cx, cy, cth, v, d)
-                dh = (cth - goal_th + math.pi) % (2 * math.pi) - math.pi
+                dh = _angle_diff(cth, goal_th)
                 total += self.w_pos     * ((cx - goal_x) ** 2 + (cy - goal_y) ** 2)
                 total += self.w_heading * dh ** 2
                 total += self.w_delta   * d ** 2

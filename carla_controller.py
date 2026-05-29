@@ -28,7 +28,12 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from config import CarConfig
-from geom import angle_diff as _angle_diff, split_by_gear as _split_by_gear
+from geom import (
+    PURE_PURSUIT_L2_FLOOR as _L2_FLOOR,
+    angle_diff as _angle_diff,
+    closest_index as _closest_index,
+    split_by_gear as _split_by_gear,
+)
 from trajectory import Waypoint
 
 
@@ -103,12 +108,7 @@ class CarlaPurePursuitController:
         gear: int,
     ) -> Tuple[int, Waypoint]:
         # advance closest index in a small forward window
-        end = min(len(seg), self._segment_target_idx + 40)
-        best_i, best_d = self._segment_target_idx, float("inf")
-        for i in range(self._segment_target_idx, end):
-            d = (seg[i].x - x) ** 2 + (seg[i].y - y) ** 2
-            if d < best_d:
-                best_d, best_i = d, i
+        best_i = _closest_index(seg, x, y, self._segment_target_idx, window=40)
         self._segment_target_idx = best_i
 
         Ld = self.cfg.lookahead_base + self.cfg.lookahead_gain * (
@@ -231,7 +231,7 @@ class CarlaPurePursuitController:
         # terminus). Cap implied |curvature| at 2/min_ld via the floor; at
         # min_ld = 0.05 m this allows |curvature| ≤ 40 m^-1 — well above any
         # real maneuver but avoids single-tick steering snaps.
-        L2 = max(L2, 0.0025)
+        L2 = max(L2, _L2_FLOOR)
         curvature = 2.0 * ly / L2
         delta_rad = math.atan(self.cc.wheelbase * curvature)
         if gear < 0:

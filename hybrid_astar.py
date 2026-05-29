@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from config import CarConfig, ParkingConfig
-from geom import angle_diff as _angle_diff
+from geom import (
+    angle_diff as _angle_diff,
+    path_length as _path_length,
+    wrap_pi as _wrap_pi,
+)
 from parking_lot import ParkingLot, Rect
 import reeds_shepp
 from scenarios import obstacles_for
@@ -306,7 +310,7 @@ class HybridAStarPlanner:
             x += direction * ds * math.cos(theta)
             y += direction * ds * math.sin(theta)
             theta += direction * ds * math.tan(steer) / self.cc.wheelbase
-            theta = (theta + math.pi) % (2 * math.pi) - math.pi
+            theta = _wrap_pi(theta)
             travelled += ds
             if not self.grid.pose_is_valid((x, y, theta)):
                 return None
@@ -459,12 +463,6 @@ class HybridAStarPlanner:
         smoothed.append(cleaned[-1])
         return smoothed
 
-    def _path_length(self, waypoints: Sequence[Waypoint]) -> float:
-        return sum(
-            math.hypot(b.x - a.x, b.y - a.y)
-            for a, b in zip(waypoints, waypoints[1:])
-        )
-
     def _metrics(
         self,
         waypoints: Sequence[Waypoint],
@@ -475,8 +473,8 @@ class HybridAStarPlanner:
         raw_waypoints: Optional[Sequence[Waypoint]] = None,
     ) -> dict:
         raw_waypoints = raw_waypoints or waypoints
-        path_length = self._path_length(waypoints)
-        raw_path_length = self._path_length(raw_waypoints)
+        path_length = _path_length(waypoints)
+        raw_path_length = _path_length(raw_waypoints)
 
         final = waypoints[-1]
         final_pose = (final.x, final.y, final.theta)

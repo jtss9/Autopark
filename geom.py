@@ -14,6 +14,13 @@ import math
 from typing import List, Optional, Sequence, Tuple
 
 
+# Pure Pursuit curvature floor: clamp the squared lookahead distance so
+# `2*ly / L2` stays bounded when the lookahead target sits essentially under
+# the rear axle. 0.05 m floor -> 0.0025 m^2. Shared by the Pygame tracker and
+# the CARLA controller so the two Pure Pursuit implementations cannot drift.
+PURE_PURSUIT_L2_FLOOR = 0.05 ** 2
+
+
 def angle_diff(a: float, b: float) -> float:
     """Smallest signed difference a - b wrapped into [-pi, pi]."""
     return (a - b + math.pi) % (2 * math.pi) - math.pi
@@ -66,3 +73,29 @@ def path_length(waypoints: Sequence) -> float:
         math.hypot(b.x - a.x, b.y - a.y)
         for a, b in zip(waypoints, waypoints[1:])
     )
+
+
+def closest_index(
+    waypoints: Sequence,
+    x: float,
+    y: float,
+    start: int = 0,
+    window: Optional[int] = None,
+) -> int:
+    """Index of the waypoint nearest (x, y), searching forward from `start`.
+
+    Scans `[start, start + window)` when `window` is given, otherwise
+    `[start, end)`. Distances are compared squared (monotonic) to keep the
+    hot loop sqrt-free. Returns `start` when the search range is empty.
+
+    Unifies the per-segment forward-window search previously copied into
+    tracker.py, carla_controller.py, and carla_demo.py.
+    """
+    end = len(waypoints) if window is None else min(len(waypoints), start + window)
+    best_i, best_d = start, float("inf")
+    for i in range(start, end):
+        p = waypoints[i]
+        d = (p.x - x) ** 2 + (p.y - y) ** 2
+        if d < best_d:
+            best_d, best_i = d, i
+    return best_i

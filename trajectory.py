@@ -341,7 +341,7 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
         wps.append(Waypoint(car.x, car.y, car.theta))
 
         dist = math.hypot(car.x - goal.x, car.y - goal.y)
-        dh   = abs((car.theta - goal.theta + math.pi) % (2 * math.pi) - math.pi)
+        dh   = abs(_angle_diff(car.theta, goal.theta))
         if dist < 0.15 and dh < 0.1:
             break
     else:
@@ -470,7 +470,7 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
             wps.append(Waypoint(car.x, car.y, car.theta))
 
             dist = math.hypot(car.x - goal.x, car.y - goal.y)
-            dh   = abs((car.theta - goal.theta + math.pi) % (2 * math.pi) - math.pi)
+            dh   = abs(_angle_diff(car.theta, goal.theta))
             if dist < 0.15 and dh < 0.1:
                 elapsed = time.perf_counter() - t0
                 print(f" done in {elapsed:.1f}s ({len(wps)} waypoints, "

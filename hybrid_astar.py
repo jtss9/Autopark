@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from config import CarConfig, ParkingConfig
+from geom import angle_diff as _angle_diff
 from parking_lot import ParkingLot, Rect
 import reeds_shepp
 from scenarios import obstacles_for
@@ -21,10 +22,6 @@ from trajectory import TrajectoryResult, Waypoint
 
 
 Pose = Tuple[float, float, float]
-
-
-def _angle_diff(a: float, b: float) -> float:
-    return (a - b + math.pi) % (2 * math.pi) - math.pi
 
 
 @dataclass(frozen=True)

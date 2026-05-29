@@ -16,12 +16,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from config import CarConfig
+from geom import angle_diff as _angle_diff, split_by_gear as _split_by_gear
 from parking_lot import ParkingLot
 from trajectory import Waypoint
-
-
-def _angle_diff(a: float, b: float) -> float:
-    return (a - b + math.pi) % (2 * math.pi) - math.pi
 
 
 @dataclass
@@ -47,34 +44,6 @@ class TrackerResult:
     final_heading_error_deg: float
     fully_in_spot: bool
     cusps: int
-
-
-def _split_by_gear(planned: Sequence[Waypoint]) -> List[Tuple[int, List[Waypoint]]]:
-    """Split a planned path into (gear, segment) chunks."""
-    segments: List[Tuple[int, List[Waypoint]]] = []
-    if len(planned) < 2:
-        return segments
-
-    current_gear: Optional[int] = None
-    current_seg: List[Waypoint] = [planned[0]]
-    for a, b in zip(planned, planned[1:]):
-        dx = b.x - a.x
-        dy = b.y - a.y
-        if math.hypot(dx, dy) < 1e-6:
-            current_seg.append(b)
-            continue
-        heading_dot = math.cos(a.theta) * dx + math.sin(a.theta) * dy
-        gear = 1 if heading_dot >= 0 else -1
-        if current_gear is None:
-            current_gear = gear
-        if gear != current_gear:
-            segments.append((current_gear, current_seg))
-            current_gear = gear
-            current_seg = [a]
-        current_seg.append(b)
-    if current_gear is not None and len(current_seg) >= 2:
-        segments.append((current_gear, current_seg))
-    return segments
 
 
 def _cross_track_error(
@@ -149,11 +118,15 @@ def _track_segment(
             ly = -ly
 
         L2 = lx * lx + ly * ly
-        if L2 < 1e-6:
-            delta = 0.0
-        else:
-            curvature = 2.0 * ly / L2
-            delta = math.atan(cc.wheelbase * curvature)
+        # Floor L2 to a small minimum so 2*ly/L2 stays bounded when the
+        # target lookahead is essentially under the rear axle. Without the
+        # floor a 1e-3 m × 1e-4 m lookahead produces curvature ~ 90 m^-1 and
+        # saturates the wheel for one tick. The floor caps the implied
+        # |curvature| at 2/min_ld; at min_ld = 0.05 m that allows up to
+        # 40 m^-1, well above any physical maneuver but smooth.
+        L2 = max(L2, 0.0025)  # 0.05 m floor
+        curvature = 2.0 * ly / L2
+        delta = math.atan(cc.wheelbase * curvature)
         if gear < 0:
             delta = -delta
         delta = max(-cc.max_steer, min(cc.max_steer, delta))
@@ -167,13 +140,18 @@ def _track_segment(
         cte_samples.append(_cross_track_error(seg, x, y, idx))
 
         # Stop the segment once we are close to its terminal waypoint AND on
-        # the last index, or once we have passed it.
+        # the last index, or once we have clearly passed it.
         end_dist = math.hypot(x - target_seg_end.x, y - target_seg_end.y)
+        end_heading = abs(_angle_diff(theta, target_seg_end.theta))
         if idx >= last_idx and end_dist < cfg.segment_xy_tol:
             return executed, cte_samples, (x, y, theta), True
         if idx >= last_idx and end_dist > cfg.segment_xy_tol * 4:
-            # We overshot; bail out so the next segment can correct.
-            return executed, cte_samples, (x, y, theta), True
+            # Overshot far past the endpoint. Only accept the segment if the
+            # heading is still close to the planned terminal heading; otherwise
+            # report the segment as failed so all_segments_ok flips to False
+            # and the tracker message reflects the real divergence.
+            seg_ok = end_heading < math.radians(cfg.segment_theta_tol_deg * 2)
+            return executed, cte_samples, (x, y, theta), seg_ok
 
     return executed, cte_samples, (x, y, theta), False
 

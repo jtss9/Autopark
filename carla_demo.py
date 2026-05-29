@@ -45,6 +45,7 @@ from carla_controller import (
     control_to_carla,
 )
 from config import CarConfig, ParkingConfig
+from geom import angle_diff as _angle_diff
 from hybrid_astar import (
     HybridAStarPlanner,
     OccupancyGrid,
@@ -54,10 +55,6 @@ from hybrid_astar import (
 from parking_lot import ParkingLot, Rect
 from scenarios import obstacles_for
 from trajectory import Waypoint
-
-
-def _angle_diff(a: float, b: float) -> float:
-    return (a - b + math.pi) % (2 * math.pi) - math.pi
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +137,13 @@ def _execute_drv_run(
     dt: float = 0.05,
     max_steps: int = 4000,
 ) -> Tuple[List[Tuple[float, float, float]], List[float], bool, str]:
-    """Simulate the controller against our own bicycle model (no CARLA)."""
+    """Simulate the controller against our own bicycle model (no CARLA).
+
+    The dry-run integrator constants (accel_per_throttle, decel_per_brake,
+    rolling_decel) are intentionally proportional to the controller's
+    throttle_kp / brake_kp so the closed loop stays well-behaved when the
+    operator retunes the gains via --ctl-* flags.
+    """
     ctl = CarlaPurePursuitController(planned, cc, ctl_cfg)
 
     x, y, theta = planned[0].x, planned[0].y, planned[0].theta
@@ -148,12 +151,14 @@ def _execute_drv_run(
     poses: List[Tuple[float, float, float]] = [(x, y, theta)]
     ctes: List[float] = []
 
-    # Simplified longitudinal model: treat the controller's (throttle - brake)
-    # as a smooth acceleration request, with a small deceleration coefficient
-    # representing rolling resistance.
-    accel_per_throttle = 2.0   # m/s^2 at full throttle
-    decel_per_brake = 4.0      # m/s^2 at full brake
-    rolling_decel = 0.4        # m/s^2
+    # Simplified longitudinal model. The accel/decel coefficients are scaled
+    # so a controller running at full throttle reaches the configured target
+    # speed in ~1.5 s — this keeps the dry-run representative when the
+    # operator overrides ControlConfig.target_forward_speed via --ctl-*.
+    target_speed = ctl.cfg.target_forward_speed
+    accel_per_throttle = max(1.0, target_speed / 0.6)  # m/s^2 at full throttle
+    decel_per_brake = max(2.0, 2.0 * accel_per_throttle)
+    rolling_decel = 0.4
 
     for step in range(max_steps):
         cmd: ControlCommand = ctl.step((x, y, theta), speed, dt)
@@ -183,6 +188,7 @@ def _execute_drv_run(
 def run_dry(
     parking_type: str = "perpendicular",
     obstacle_scenario: str = "none",
+    ctl_cfg: Optional[ControlConfig] = None,
 ) -> DemoResult:
     """Run the full pipeline against the internal simulator (no CARLA)."""
     cc = CarConfig()
@@ -209,7 +215,7 @@ def run_dry(
             max_cte_m=float("nan"),
         )
 
-    poses, ctes, exec_ok, exec_msg = _execute_drv_run(waypoints, cc)
+    poses, ctes, exec_ok, exec_msg = _execute_drv_run(waypoints, cc, ctl_cfg=ctl_cfg)
     fx, fy, fth = poses[-1]
     goal = waypoints[-1]
     pos_err = math.hypot(fx - goal.x, fy - goal.y)
@@ -242,6 +248,7 @@ def run_carla(
     parking_type: str,
     spot_offset_xy: Tuple[float, float] = (12.0, 0.0),
     max_seconds: float = 60.0,
+    ctl_cfg: Optional[ControlConfig] = None,
 ) -> DemoResult:
     """
     Run the parking pipeline on a real CARLA server.
@@ -249,7 +256,9 @@ def run_carla(
     The spot is taken to be (0, 0) in the planner frame; the ego is spawned
     at `spot_offset_xy` relative to the spot in the planner frame. In a real
     deployment these come from a parking-lot annotation or a SLAM map; here
-    we expose them as simple CLI parameters for the demo.
+    we expose them as simple CLI parameters for the demo. `ctl_cfg` lets
+    callers retune the Pure Pursuit gains for a specific vehicle without
+    editing source.
     """
     require_carla()
     import carla  # noqa: F401  -- ensure imported
@@ -284,10 +293,14 @@ def run_carla(
             cc = CarConfig(length=length, width=width)
             cc.wheelbase = wheelbase
 
-            # Extract obstacles in a 25 m radius, skipping the ego.
+            # Extract obstacles in a 25 m radius around the actual ego, not
+            # around the spot — for non-trivial spot_offset_xy the ego may be
+            # far enough that the spot-centred ball would miss obstacles
+            # immediately next to the start pose.
+            ego_loc = ego.get_transform().location
             obstacles = extract_static_obstacles(
                 world,
-                ego_xy_world=spot_xy_world,
+                ego_xy_world=(ego_loc.x, ego_loc.y),
                 radius_m=25.0,
                 frame=frame,
                 ignore_ids=(ego.id,),
@@ -312,11 +325,16 @@ def run_carla(
                     max_cte_m=float("nan"),
                 )
 
-            ctl = CarlaPurePursuitController(waypoints, cc)
+            ctl = CarlaPurePursuitController(waypoints, cc, ctl_cfg)
             dt = conn.fixed_delta_seconds
             poses: List[Tuple[float, float, float]] = []
             ctes: List[float] = []
+            # Seed the executed-pose list with the planner-frame start pose so
+            # downstream code can always read poses[-1] even if max_seconds is
+            # 0 or conn.tick() throws on the very first iteration.
+            poses.append(pose_from_actor(ego, frame))
 
+            cmd: Optional[ControlCommand] = None
             elapsed = 0.0
             while elapsed < max_seconds:
                 conn.tick()
@@ -330,8 +348,13 @@ def run_carla(
                 if cmd.done:
                     break
                 elapsed += dt
-            exec_msg = "carla: controller reported done" if cmd.done else \
-                f"carla: aborted at {elapsed:.1f}s (no convergence)"
+
+            if cmd is None:
+                exec_msg = "carla: control loop never executed (max_seconds <= 0)"
+            elif cmd.done:
+                exec_msg = "carla: controller reported done"
+            else:
+                exec_msg = f"carla: aborted at {elapsed:.1f}s (no convergence)"
 
             goal = waypoints[-1]
             fx, fy, fth = poses[-1]
@@ -346,7 +369,7 @@ def run_carla(
                 planning_time_s=planning_time,
                 planned_waypoints=list(waypoints),
                 executed_poses=poses,
-                executed_success=cmd.done and pos_err < 0.5,
+                executed_success=bool(cmd and cmd.done and pos_err < 0.5),
                 executed_message=exec_msg,
                 final_pos_error_m=pos_err,
                 final_heading_error_deg=head_err,
@@ -384,7 +407,34 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--town", default=None)
     parser.add_argument("--probe", action="store_true",
                         help="Just probe whether the CARLA PythonAPI is importable.")
+    parser.add_argument("--max-seconds", type=float, default=60.0,
+                        help="Max wall-clock seconds for the control loop "
+                             "(--carla mode only).")
+    parser.add_argument("--ctl-forward-speed", type=float, default=None,
+                        help="Override ControlConfig.target_forward_speed (m/s).")
+    parser.add_argument("--ctl-reverse-speed", type=float, default=None,
+                        help="Override ControlConfig.target_reverse_speed (m/s).")
+    parser.add_argument("--ctl-throttle-kp", type=float, default=None,
+                        help="Override ControlConfig.throttle_kp.")
+    parser.add_argument("--ctl-brake-kp", type=float, default=None,
+                        help="Override ControlConfig.brake_kp.")
+    parser.add_argument("--ctl-lookahead", type=float, default=None,
+                        help="Override ControlConfig.lookahead_base (m).")
     return parser.parse_args(argv)
+
+
+def _ctl_cfg_from_args(args: argparse.Namespace) -> Optional[ControlConfig]:
+    overrides = {
+        "target_forward_speed": args.ctl_forward_speed,
+        "target_reverse_speed": args.ctl_reverse_speed,
+        "throttle_kp": args.ctl_throttle_kp,
+        "brake_kp": args.ctl_brake_kp,
+        "lookahead_base": args.ctl_lookahead,
+    }
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+    if not overrides:
+        return None
+    return ControlConfig(**overrides)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -393,6 +443,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.probe:
         print(f"CARLA_AVAILABLE={CARLA_AVAILABLE}")
         return 0
+
+    ctl_cfg = _ctl_cfg_from_args(args)
 
     if args.carla:
         if not CARLA_AVAILABLE:
@@ -405,9 +457,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             port=args.port,
             town=args.town,
             parking_type=args.mode,
+            max_seconds=args.max_seconds,
+            ctl_cfg=ctl_cfg,
         )
     else:
-        result = run_dry(parking_type=args.mode, obstacle_scenario=args.scenario)
+        result = run_dry(
+            parking_type=args.mode,
+            obstacle_scenario=args.scenario,
+            ctl_cfg=ctl_cfg,
+        )
 
     print("carla_demo:", result.summary())
     return 0 if result.executed_success else 1

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from config import CarConfig, ParkingConfig
+from geom import angle_diff as _angle_diff
 from hybrid_astar import (
     OccupancyGrid,
     parallel_goal_pose,
@@ -39,10 +40,6 @@ from trajectory import TrajectoryResult, Waypoint
 
 Pose = Tuple[float, float, float]
 StateKey = Tuple[int, int, int]
-
-
-def _angle_diff(a: float, b: float) -> float:
-    return (a - b + math.pi) % (2 * math.pi) - math.pi
 
 
 @dataclass

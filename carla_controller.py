@@ -28,40 +28,11 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from config import CarConfig
+from geom import angle_diff as _angle_diff, split_by_gear as _split_by_gear
 from trajectory import Waypoint
 
 
 Pose = Tuple[float, float, float]
-
-
-def _angle_diff(a: float, b: float) -> float:
-    return (a - b + math.pi) % (2 * math.pi) - math.pi
-
-
-def _split_by_gear(planned: Sequence[Waypoint]) -> List[Tuple[int, List[Waypoint]]]:
-    segments: List[Tuple[int, List[Waypoint]]] = []
-    if len(planned) < 2:
-        return segments
-    current_gear: Optional[int] = None
-    current_seg: List[Waypoint] = [planned[0]]
-    for a, b in zip(planned, planned[1:]):
-        dx = b.x - a.x
-        dy = b.y - a.y
-        if math.hypot(dx, dy) < 1e-6:
-            current_seg.append(b)
-            continue
-        heading_dot = math.cos(a.theta) * dx + math.sin(a.theta) * dy
-        gear = 1 if heading_dot >= 0 else -1
-        if current_gear is None:
-            current_gear = gear
-        if gear != current_gear:
-            segments.append((current_gear, current_seg))
-            current_gear = gear
-            current_seg = [a]
-        current_seg.append(b)
-    if current_gear is not None and len(current_seg) >= 2:
-        segments.append((current_gear, current_seg))
-    return segments
 
 
 @dataclass
@@ -191,16 +162,33 @@ class CarlaPurePursuitController:
         # segment direction, treat the segment as done even if the heading
         # is slightly off. Without this we keep tracking forward forever
         # whenever we glide past the endpoint by more than segment_xy_tol.
+        #
+        # The reference direction is taken from the last waypoint at least
+        # 0.5 m back along the segment (or seg_end's planned heading if the
+        # segment is shorter than that). Using seg[-2] alone gave a noisy
+        # projection when the smoother + densifier left a sub-decimetre
+        # terminal sample.
         overshot = False
-        if self._segment_target_idx >= last_idx and len(seg) >= 2:
-            prev = seg[-2]
-            seg_dx = seg_end.x - prev.x
-            seg_dy = seg_end.y - prev.y
+        if self._segment_target_idx >= last_idx:
+            seg_dx, seg_dy = 0.0, 0.0
+            for k in range(len(seg) - 2, -1, -1):
+                cand_dx = seg_end.x - seg[k].x
+                cand_dy = seg_end.y - seg[k].y
+                if math.hypot(cand_dx, cand_dy) >= 0.5:
+                    seg_dx, seg_dy = cand_dx, cand_dy
+                    break
             seg_len = math.hypot(seg_dx, seg_dy)
-            if seg_len > 1e-6:
-                advance = ((x - seg_end.x) * seg_dx + (y - seg_end.y) * seg_dy) / seg_len
-                if advance > 0:
-                    overshot = True
+            if seg_len < 1e-6:
+                # Segment shorter than 0.5 m — fall back to the planned end
+                # heading direction so the projection is well defined.
+                seg_dx = math.cos(seg_end.theta)
+                seg_dy = math.sin(seg_end.theta)
+                if gear < 0:
+                    seg_dx, seg_dy = -seg_dx, -seg_dy
+                seg_len = 1.0
+            advance = ((x - seg_end.x) * seg_dx + (y - seg_end.y) * seg_dy) / seg_len
+            if advance > 0:
+                overshot = True
 
         if self._segment_target_idx >= last_idx and (
             (end_dist < self.cfg.segment_xy_tol
@@ -238,11 +226,14 @@ class CarlaPurePursuitController:
             ly = -ly
 
         L2 = lx * lx + ly * ly
-        if L2 < 1e-6:
-            delta_rad = 0.0
-        else:
-            curvature = 2.0 * ly / L2
-            delta_rad = math.atan(self.cc.wheelbase * curvature)
+        # Floor L2 so 2*ly/L2 stays bounded when the lookahead vector is
+        # essentially under the rear axle (numerical noise at segment
+        # terminus). Cap implied |curvature| at 2/min_ld via the floor; at
+        # min_ld = 0.05 m this allows |curvature| ≤ 40 m^-1 — well above any
+        # real maneuver but avoids single-tick steering snaps.
+        L2 = max(L2, 0.0025)
+        curvature = 2.0 * ly / L2
+        delta_rad = math.atan(self.cc.wheelbase * curvature)
         if gear < 0:
             delta_rad = -delta_rad
 

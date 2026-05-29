@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable, List, Sequence
 
 from config import CarConfig, ParkingConfig
+from geom import angle_diff as _angle_diff, path_length as _path_length_seq
 from parking_lot import ParkingLot
 from scenarios import SCENARIO_NAMES, normalize_scenario
 from trajectory import TrajectoryResult, plan_trajectory
@@ -56,6 +57,7 @@ FIELDNAMES = [
     "mean_cte_m",
     "max_cte_m",
     "exec_final_pos_error_m",
+    "exec_final_heading_error_deg",
     "exec_fully_in_spot",
     "cusps",
     "training_time_s",
@@ -74,15 +76,8 @@ SWEEP_CHOICES = ("lane_width", "spot_size", "car_size", "none")
 PLANNER_CHOICES = ("baseline", "hybrid_astar", "qlearn", "all")
 
 
-def _angle_diff(a: float, b: float) -> float:
-    return (a - b + math.pi) % (2 * math.pi) - math.pi
-
-
 def _path_length(result: TrajectoryResult) -> float:
-    return sum(
-        math.hypot(b.x - a.x, b.y - a.y)
-        for a, b in zip(result.waypoints, result.waypoints[1:])
-    )
+    return _path_length_seq(result.waypoints)
 
 
 def _goal_pose(lot: ParkingLot) -> tuple[float, float, float]:
@@ -184,6 +179,7 @@ def _result_row(
             "mean_cte_m": tm.get("mean_cte_m"),
             "max_cte_m": tm.get("max_cte_m"),
             "exec_final_pos_error_m": tm.get("exec_final_pos_error_m"),
+            "exec_final_heading_error_deg": tm.get("exec_final_heading_error_deg"),
             "exec_fully_in_spot": tm.get("exec_fully_in_spot"),
             "cusps": tm.get("cusps"),
         })
@@ -280,8 +276,10 @@ def run_case(
         can_run, reason = _can_run_baseline(pc)
         if not can_run:
             return _skip_row(pc, cc, planner, sweep, reason)
-        pc = replace(pc, planner="multi" if pc.lane_width < 4.5 else "single")
-        requested_planner = "baseline"
+        # "baseline" in the evaluator means the MPC family; pick single/multi
+        # by lane width and pass it as the explicit planner so plan_trajectory
+        # routes to the MPC branch (not the new pc.planner fallback).
+        requested_planner = "multi" if pc.lane_width < 4.5 else "single"
     elif planner == "qlearn":
         requested_planner = "qlearn"
     else:
@@ -329,9 +327,26 @@ def write_rows(rows: Sequence[dict], output: str | None) -> None:
 def print_summary(rows: Sequence[dict], stream) -> None:
     total = len(rows)
     successes = [r for r in rows if r.get("success") is True]
-    numeric_time = [float(r["planning_time_s"]) for r in rows if r.get("planning_time_s")]
-    numeric_path = [float(r["path_length_m"]) for r in rows if r.get("path_length_m")]
-    numeric_error = [float(r["final_pos_error_m"]) for r in rows if r.get("final_pos_error_m")]
+
+    def _numeric_col(rows: Sequence[dict], col: str) -> list:
+        # Use a `is not None` / `!= ""` filter rather than truthiness so that
+        # legitimate zero values (planning_time_s=0.0 from a cached run,
+        # final_pos_error_m=0.0 from an exact RS shot) are included in the
+        # average instead of being silently dropped.
+        out = []
+        for r in rows:
+            v = r.get(col)
+            if v is None or v == "":
+                continue
+            try:
+                out.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    numeric_time = _numeric_col(rows, "planning_time_s")
+    numeric_path = _numeric_col(rows, "path_length_m")
+    numeric_error = _numeric_col(rows, "final_pos_error_m")
     full_spot = [r for r in rows if r.get("fully_in_spot") is True]
 
     def avg(values: Sequence[float]) -> float:

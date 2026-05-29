@@ -45,13 +45,19 @@ class Simulation:
         self.cc  = car_config
         self.lot = ParkingLot(parking_config, car_config)
         self._compute_scale()
+        # Resolve the requested planner: env var > Settings UI choice. We
+        # normalise the legacy "baseline" alias to the concrete MPC variant
+        # so plan_trajectory dispatches deterministically and the HUD label
+        # matches what actually ran. AUTOPARK_PLANNER=baseline means
+        # "single-step MPC" (the original baseline); to fall back to the
+        # Settings UI choice, leave AUTOPARK_PLANNER unset.
         env_planner = os.environ.get("AUTOPARK_PLANNER")
         if env_planner:
             requested_planner = env_planner
-        elif parking_config.planner in ("hybrid_astar", "qlearn"):
-            requested_planner = parking_config.planner
+            if requested_planner == "baseline":
+                requested_planner = "single"
         else:
-            requested_planner = "baseline"
+            requested_planner = parking_config.planner or "single"
         self.planner_name = self._effective_planner_name(requested_planner)
 
         track_env = os.environ.get("AUTOPARK_TRACK", "")
@@ -69,11 +75,14 @@ class Simulation:
         self.show_grid = False
         self.show_executed = bool(self.result.executed_waypoints)
 
-        # Build a lightweight occupancy grid for visualization regardless of planner
+        # Build a lightweight occupancy grid for visualization regardless of
+        # planner. Cache the obstacle list so per-frame drawing does not
+        # re-run scenario dispatch + list allocation 60 times per second.
+        self._obstacles = obstacles_for(self.lot)
         self._viz_grid = OccupancyGrid(
             self.lot,
             resolution=0.5,
-            obstacles=obstacles_for(self.lot),
+            obstacles=self._obstacles,
         )
 
     def _effective_planner_name(self, requested_planner: str) -> str:
@@ -158,20 +167,38 @@ class Simulation:
                 pygame.draw.lines(surf, C_PATH_EXEC, False, exec_pts, 2)
 
     def _draw_grid(self, surf):
+        """Overlay the occupancy grid.
+
+        Free cells are rendered once into a cached background surface (built
+        on first toggle) and blitted thereafter. Blocked cells are drawn on
+        top each frame so changes (if obstacles ever become dynamic) update
+        live without rebuilding the cache.
+        """
         if not self.show_grid:
             return
         g = self._viz_grid
         res = g.resolution
-        for ix in range(0, g.width, 1):
-            for iy in range(0, g.height, 1):
-                x = g.min_x + ix * res
-                y = g.min_y + iy * res
-                color = C_GRID_BLOCK if (ix, iy) in g.blocked else C_GRID_FREE
-                x1, y1 = self.w2s(x, y + res)
-                x2, y2 = self.w2s(x + res, y)
-                rect = pygame.Rect(min(x1, x2), min(y1, y2),
-                                   abs(x2 - x1), abs(y2 - y1))
-                pygame.draw.rect(surf, color, rect, 1)
+        if getattr(self, "_grid_cache", None) is None:
+            cache = pygame.Surface((WIN_W, WIN_H), flags=pygame.SRCALPHA)
+            for ix in range(g.width):
+                for iy in range(g.height):
+                    x = g.min_x + ix * res
+                    y = g.min_y + iy * res
+                    x1, y1 = self.w2s(x, y + res)
+                    x2, y2 = self.w2s(x + res, y)
+                    rect = pygame.Rect(min(x1, x2), min(y1, y2),
+                                       abs(x2 - x1), abs(y2 - y1))
+                    pygame.draw.rect(cache, C_GRID_FREE, rect, 1)
+            self._grid_cache = cache
+        surf.blit(self._grid_cache, (0, 0))
+        for ix, iy in g.blocked:
+            x = g.min_x + ix * res
+            y = g.min_y + iy * res
+            x1, y1 = self.w2s(x, y + res)
+            x2, y2 = self.w2s(x + res, y)
+            rect = pygame.Rect(min(x1, x2), min(y1, y2),
+                               abs(x2 - x1), abs(y2 - y1))
+            pygame.draw.rect(surf, C_GRID_BLOCK, rect, 1)
 
     def _draw_scene(self, surf, step: int):
         surf.fill(C_BG)
@@ -199,7 +226,7 @@ class Simulation:
         lbl = font_s.render("Spot", True, C_SPOT_LINE)
         surf.blit(lbl, lbl.get_rect(center=spot_r.center))
 
-        for obs in obstacles_for(self.lot):
+        for obs in self._obstacles:
             ox1, oy1 = self.w2s(obs.x, obs.top)
             ox2, oy2 = self.w2s(obs.right, obs.y)
             obs_r = pygame.Rect(min(ox1, ox2), min(oy1, oy2),
@@ -231,11 +258,14 @@ class Simulation:
         wps    = self.result.waypoints
         total  = max(len(wps) - 1, 1)
 
-        # Determine current phase name
+        # Determine current phase name. Guard against any planner that
+        # returns mismatched-length phase_starts/phase_names so the per-frame
+        # HUD draw cannot raise IndexError and kill the pygame loop.
         phase_name = ""
+        names = self.result.phase_names
         for i, ps in enumerate(self.result.phase_starts):
-            if step >= ps:
-                phase_name = self.result.phase_names[i]
+            if step >= ps and i < len(names):
+                phase_name = names[i]
 
         type_label = ("Reverse into Spot" if self.pc.parking_type == "perpendicular"
                       else "Parallel Parking")

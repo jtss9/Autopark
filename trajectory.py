@@ -11,9 +11,10 @@ Perpendicular maneuver (倒車入庫):
 import math
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from config import CarConfig, ParkingConfig
+from geom import angle_diff as _angle_diff, path_length as _path_length
 from parking_lot import ParkingLot
 
 
@@ -39,20 +40,32 @@ class TrajectoryResult:
 def plan_trajectory(
     pc: ParkingConfig,
     cc: CarConfig,
-    planner: str = "baseline",
+    planner: Optional[str] = None,
     track: bool = False,
 ) -> TrajectoryResult:
-    if planner == "qlearn" or pc.planner == "qlearn":
+    """Dispatch to the right planner backend.
+
+    `planner` is the explicit caller intent and always wins. When None,
+    we fall back to pc.planner so the Settings-UI selection is honoured.
+    The previous `pc.planner == "hybrid_astar"` OR branches silently
+    shadowed an explicit baseline request — fixed by making the
+    resolution explicit and consulting pc.planner only as fallback.
+    """
+    effective = planner if planner is not None else pc.planner
+
+    if effective == "qlearn":
         from rl_qlearn import plan_qlearn
         result = plan_qlearn(pc, cc)
-    elif planner == "hybrid_astar" or pc.planner == "hybrid_astar":
+    elif effective == "hybrid_astar":
         from hybrid_astar import plan_hybrid_astar
         result = plan_hybrid_astar(pc, cc)
     elif pc.obstacle_scenario != "none":
+        # MPC backends have no obstacle awareness; auto-promote to Hybrid A*
+        # for any non-empty scenario so we never produce a colliding plan.
         from hybrid_astar import plan_hybrid_astar
         result = plan_hybrid_astar(pc, cc)
     elif pc.parking_type == "perpendicular":
-        if pc.planner == "multi":
+        if effective == "multi":
             result = _plan_perpendicular_multistep(pc, cc)
         else:
             result = _plan_perpendicular_mpc(pc, cc)
@@ -111,22 +124,11 @@ def _densify_for_tracking(
     return out
 
 
-def _angle_diff(a: float, b: float) -> float:
-    return (a - b + math.pi) % (2 * math.pi) - math.pi
-
-
 def _goal_pose(lot: ParkingLot) -> tuple:
     spot = lot.spot_rect
     if lot.pc.parking_type == "parallel":
         return spot.x + 0.15, spot.y + spot.h / 2, 0.0
     return spot.x + spot.w / 2, spot.top - 0.15, -math.pi / 2
-
-
-def _path_length(waypoints: List[Waypoint]) -> float:
-    return sum(
-        math.hypot(b.x - a.x, b.y - a.y)
-        for a, b in zip(waypoints, waypoints[1:])
-    )
 
 
 def _fully_in_spot(lot: ParkingLot, waypoints: List[Waypoint]) -> bool:
@@ -167,10 +169,15 @@ def _result_with_metrics(
     if feasible and not fully_in_spot:
         final_message = "Final car is not fully inside the parking spot."
 
+    # NOTE: MPC reports `expanded_states = 0` because it does not perform a
+    # graph search. Hybrid A* sets this to the search-tree size and Q-learn
+    # sets it to the Q-table size; keeping MPC at 0 makes cross-planner
+    # comparisons of search effort unambiguous (rather than overloading the
+    # column with waypoint count, which has a separate `waypoints` field).
     metrics = {
         "planning_time_s": planning_time_s,
         "iterations": iterations,
-        "expanded_states": len(waypoints),
+        "expanded_states": 0,
         "path_length_m": _path_length(waypoints),
         "waypoints": len(waypoints),
         "final_pos_error_m": final_pos_error,

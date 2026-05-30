@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# CSV outputs are intentionally not committed; figures are committed for the report.
+results/*.csv

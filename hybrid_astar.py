@@ -1,223 +1,544 @@
 """
-Hybrid A* planner for perpendicular (reverse-into-spot) parking.
+Hybrid A* parking planner.
 
-State space: continuous (x, y, theta), discretised by a 3-tuple grid key for
-visited-set deduplication.  Motion primitives are forward/reverse ×
-five steering angles integrated with the bicycle kinematic model.
-
-Public API
-----------
-    plan_hastar(lot, cc, start, goal) -> (path, feasible, message)
-
-    path     : list of (x, y, theta, direction) — direction +1 fwd / -1 rev
-    feasible : True if a path was found
-    message  : "OK" or a human-readable failure reason
+This module is the first step toward replacing the fixed parking arc with a
+general planner over SE(2): x, y, and heading. It returns the same
+TrajectoryResult/Waypoint objects used by the current simulator.
 """
-import math
+from __future__ import annotations
+
 import heapq
-from typing import List, Tuple
+import math
+import time
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from config import CarConfig
-from parking_lot import ParkingLot
-
-# ── Tuning parameters ─────────────────────────────────────────────────────────
-_GRID_RES       = 0.30           # m — spatial cell size and arc length per primitive
-_THETA_RES      = math.pi / 36  # 5° per heading bucket
-_N_THETA        = round(2 * math.pi / _THETA_RES)  # 72 buckets
-_ARC_SUBSTEPS   = 6             # collision-check sub-steps per primitive
-_REVERSE_COST   = 1.5           # g-cost multiplier for reverse moves
-_GEAR_PENALTY   = 1.0           # extra g-cost per direction change
-_MAX_EXPANSIONS = 80_000        # search node limit
-_GOAL_DIST      = 0.30          # m — success position threshold
-_GOAL_HEADING   = 0.15          # rad — success heading threshold (~8.6°)
-_MARGIN         = 0.05          # m — collision boundary margin
+from config import CarConfig, ParkingConfig
+from geom import angle_diff as _angle_diff
+from parking_lot import ParkingLot, Rect
+import reeds_shepp
+from scenarios import obstacles_for
+from trajectory import TrajectoryResult, Waypoint
 
 
-# ── Grid key ──────────────────────────────────────────────────────────────────
-
-def _discretise(x: float, y: float, theta: float) -> Tuple[int, int, int]:
-    ix = int(math.floor(x / _GRID_RES))
-    iy = int(math.floor(y / _GRID_RES))
-    it = int(round(theta / _THETA_RES)) % _N_THETA
-    return (ix, iy, it)
+Pose = Tuple[float, float, float]
 
 
-# ── Kinematic integration ─────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class GridIndex:
+    ix: int
+    iy: int
+    ith: int
 
-def _kinematic_step(x: float, y: float, theta: float,
-                    direction: int, delta: float,
-                    arc_len: float, wheelbase: float,
-                    n_sub: int) -> Tuple[float, float, float, list]:
+
+@dataclass
+class SearchNode:
+    x: float
+    y: float
+    theta: float
+    g: float
+    parent: Optional[GridIndex]
+    direction: int
+    steer: float
+
+
+class OccupancyGrid:
     """
-    Integrate bicycle kinematics over arc_len using n_sub equal sub-steps.
-    Returns (new_x, new_y, new_theta, list_of_sub_step_poses).
-    Each element of list_of_sub_step_poses is (x, y, theta).
-    """
-    step = arc_len / n_sub
-    poses = []
-    for _ in range(n_sub):
-        x     += direction * step * math.cos(theta)
-        y     += direction * step * math.sin(theta)
-        theta += direction * step * math.tan(delta) / wheelbase
-        poses.append((x, y, theta))
-    return x, y, theta, poses
+    Lightweight occupancy grid backed by ParkingLot geometry.
 
-
-# ── Boundary check ────────────────────────────────────────────────────────────
-
-def _in_bounds(corners, lane, spot) -> bool:
+    The grid stores static obstacle cells, while validity still uses continuous
+    car-corner checks against the lane/spot shape so the car body is not reduced
+    to a point.
     """
-    Valid region = lane_rect ∪ spot_rect  (L-shape).
-    Each corner must satisfy:
-      • vertical:   lane.y + M  ≤  cy  ≤  spot.top − M
-      • horizontal: lane.x + M  ≤  cx  ≤  lane.right − M
-      • above lane: cy > lane.top − M  →  also  spot.x + M ≤ cx ≤ spot.right − M
-    """
-    M  = _MARGIN
-    lt = lane.top - M
-    for cx, cy in corners:
-        if cy < lane.y + M or cy > spot.top - M:
+
+    def __init__(
+        self,
+        lot: ParkingLot,
+        resolution: float = 0.25,
+        obstacles: Optional[Sequence[Rect]] = None,
+    ):
+        self.lot = lot
+        self.resolution = resolution
+        self.obstacles = list(obstacles or [])
+
+        min_x = min(lot.lane_rect.x, lot.spot_rect.x)
+        min_y = min(lot.lane_rect.y, lot.spot_rect.y)
+        max_x = max(lot.lane_rect.right, lot.spot_rect.right)
+        max_y = max(lot.lane_rect.top, lot.spot_rect.top)
+        pad = max(lot.cc.length, lot.cc.width)
+
+        self.min_x = min_x - pad
+        self.min_y = min_y - pad
+        self.max_x = max_x + pad
+        self.max_y = max_y + pad
+        self.width = int(math.ceil((self.max_x - self.min_x) / resolution))
+        self.height = int(math.ceil((self.max_y - self.min_y) / resolution))
+
+        self.blocked = set()
+        for obs in self.obstacles:
+            self._rasterize_obstacle(obs)
+
+    def _rasterize_obstacle(self, rect: Rect) -> None:
+        ix0, iy0 = self.world_to_cell(rect.x, rect.y)
+        ix1, iy1 = self.world_to_cell(rect.right, rect.top)
+        for ix in range(min(ix0, ix1), max(ix0, ix1) + 1):
+            for iy in range(min(iy0, iy1), max(iy0, iy1) + 1):
+                self.blocked.add((ix, iy))
+
+    def world_to_cell(self, x: float, y: float) -> Tuple[int, int]:
+        ix = int(math.floor((x - self.min_x) / self.resolution))
+        iy = int(math.floor((y - self.min_y) / self.resolution))
+        return ix, iy
+
+    def contains_point(self, x: float, y: float) -> bool:
+        ix, iy = self.world_to_cell(x, y)
+        return 0 <= ix < self.width and 0 <= iy < self.height
+
+    def point_is_blocked(self, x: float, y: float) -> bool:
+        ix, iy = self.world_to_cell(x, y)
+        return (ix, iy) in self.blocked
+
+    def _point_in_rect(self, x: float, y: float, rect: Rect, margin: float) -> bool:
+        return (
+            rect.x - margin <= x <= rect.right + margin
+            and rect.y - margin <= y <= rect.top + margin
+        )
+
+    def pose_is_fully_in_spot(self, pose: Pose, margin: float = 0.02) -> bool:
+        spot = self.lot.spot_rect
+        return all(
+            self._point_in_rect(cx, cy, spot, margin)
+            for cx, cy in self.lot.car_corners(pose)
+        )
+
+    def pose_is_valid(self, pose: Pose, margin: float = 0.03) -> bool:
+        x, y, theta = pose
+        if not self.contains_point(x, y):
             return False
-        if cx < lane.x + M or cx > lane.right - M:
-            return False
-        if cy > lt:
-            if cx < spot.x + M or cx > spot.right - M:
+
+        lane = self.lot.lane_rect
+        spot = self.lot.spot_rect
+        for cx, cy in self.lot.car_corners((x, y, theta)):
+            in_lane = self._point_in_rect(cx, cy, lane, margin)
+            in_spot = self._point_in_rect(cx, cy, spot, margin)
+            if not (in_lane or in_spot):
                 return False
-    return True
+            if self.point_is_blocked(cx, cy):
+                return False
+        return True
 
 
-# ── Admissible heuristic ──────────────────────────────────────────────────────
+class HybridAStarPlanner:
+    def __init__(
+        self,
+        lot: ParkingLot,
+        car_config: CarConfig,
+        grid: Optional[OccupancyGrid] = None,
+    ):
+        self.lot = lot
+        self.cc = car_config
+        self.grid = grid or OccupancyGrid(lot)
 
-def _heuristic(x: float, y: float, theta: float,
-               gx: float, gy: float, gtheta: float) -> float:
-    dist = math.hypot(x - gx, y - gy)
-    dh   = abs((theta - gtheta + math.pi) % (2 * math.pi) - math.pi)
-    return dist + 0.5 * dh
+        self.xy_resolution = 0.10
+        self.theta_bins = 36
+        self.motion_step = 0.45
+        self.integration_step = 0.09
+        self.goal_xy_tolerance = 0.35
+        self.goal_theta_tolerance = math.radians(12)
+        self.max_iterations = 150000
 
+        self.steering_set = (
+            -self.cc.max_steer,
+            -self.cc.max_steer * 0.5,
+            0.0,
+            self.cc.max_steer * 0.5,
+            self.cc.max_steer,
+        )
 
-# ── Path reconstruction ───────────────────────────────────────────────────────
+        # Reeds-Shepp analytic shot: try once every N expansions and
+        # always when the node is close enough to the goal.
+        self.rs_radius = max(self.cc.min_turn_radius, 0.5)
+        self.rs_step = 0.12
+        self.rs_shot_interval = 50
+        self.rs_shot_radius = 4.5  # try unconditionally inside this distance
 
-def _backtrack(came_from: dict, state_pos: dict,
-               final_key, start_key) -> List[Tuple[float, float, float, int]]:
-    """Follow parent pointers from final_key to start_key, then reverse."""
-    segments: List[Tuple[list, int]] = []
-    key = final_key
-    while came_from[key] is not None:
-        parent_key, sub_poses, direction = came_from[key]
-        segments.append((sub_poses, direction))
-        key = parent_key
-    segments.reverse()
+        # Diagnostic counters populated by plan()
+        self.rs_shot_attempts = 0
+        self.rs_shot_successes = 0
 
-    sx, sy, st = state_pos[start_key]
-    first_dir  = segments[0][1] if segments else 1
-    path: List[Tuple[float, float, float, int]] = [(sx, sy, st, first_dir)]
-    for sub_poses, direction in segments:
-        for px, py, pt in sub_poses:
-            path.append((px, py, pt, direction))
-    return path
+        # Cache RS-heuristic values on a coarse (xy,theta) grid to avoid
+        # recomputing the same RS path for every popped node.
+        self._heuristic_cache: Dict[Tuple[int, int, int], float] = {}
+        self._heuristic_xy = 0.3
+        self._heuristic_theta_bins = 24
 
+    def plan(self, start: Pose, goal: Pose) -> TrajectoryResult:
+        start_t = time.perf_counter()
+        self.rs_shot_attempts = 0
+        self.rs_shot_successes = 0
+        self._heuristic_cache.clear()
+        if not self.grid.pose_is_valid(start):
+            return TrajectoryResult([], False, "Hybrid A*: start pose is invalid.")
+        if not self.grid.pose_is_valid(goal):
+            return TrajectoryResult([], False, "Hybrid A*: goal pose is invalid.")
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+        open_heap: List[Tuple[float, int, GridIndex]] = []
+        nodes: Dict[GridIndex, SearchNode] = {}
+        best_cost: Dict[GridIndex, float] = {}
+        closed = set()
 
-def plan_hastar(
-    lot: ParkingLot,
-    cc: CarConfig,
-    start: Tuple[float, float, float],
-    goal: Tuple[float, float, float],
-) -> Tuple[List[Tuple[float, float, float, int]], bool, str]:
-    """
-    Hybrid A* search from *start* to *goal* in the drivable region of *lot*.
+        start_idx = self._index(start)
+        start_node = SearchNode(*start, g=0.0, parent=None, direction=0, steer=0.0)
+        nodes[start_idx] = start_node
+        best_cost[start_idx] = 0.0
+        counter = 0
+        heapq.heappush(open_heap, (self._heuristic(start, goal), counter, start_idx))
 
-    Parameters
-    ----------
-    lot   : ParkingLot — provides lane_rect, spot_rect, car_corners()
-    cc    : CarConfig  — provides wheelbase, max_steer
-    start : (x, y, theta) rear-axle pose in world space
-    goal  : (x, y, theta) target rear-axle pose
+        iterations = 0
+        while open_heap and iterations < self.max_iterations:
+            iterations += 1
+            _, _, current_idx = heapq.heappop(open_heap)
+            if current_idx in closed:
+                continue
+            closed.add(current_idx)
+            current = nodes[current_idx]
+            current_pose: Pose = (current.x, current.y, current.theta)
 
-    Returns
-    -------
-    (path, feasible, message)
-    path     : list of (x, y, theta, direction) tuples (+1 fwd, -1 rev)
-    feasible : True if a valid path was found
-    message  : "OK" or a human-readable failure description
-    """
-    lane = lot.lane_rect
-    spot = lot.spot_rect
-    wb   = cc.wheelbase
-    ms   = cc.max_steer
-
-    steers = [-ms, -ms * 0.5, 0.0, ms * 0.5, ms]
-    dirs   = [1, -1]
-
-    gx, gy, gtheta = goal
-    sx, sy, stheta = start
-    start_key = _discretise(sx, sy, stheta)
-
-    # came_from[key] = None (start) | (parent_key, sub_poses, direction)
-    # state_pos[key] = best known (x, y, theta) at that grid key
-    came_from: dict = {start_key: None}
-    state_pos: dict = {start_key: (sx, sy, stheta)}
-    g_cost: dict    = {start_key: 0.0}
-
-    h0 = _heuristic(sx, sy, stheta, gx, gy, gtheta)
-    # heap: (f, g, tie_breaker, x, y, theta, last_direction)
-    counter = 0
-    heap = [(h0, 0.0, counter, sx, sy, stheta, 0)]
-
-    n_expansions = 0
-
-    while heap:
-        f, g, _, x, y, theta, last_dir = heapq.heappop(heap)
-        n_expansions += 1
-
-        if n_expansions > _MAX_EXPANSIONS:
-            return [], False, (
-                f"Hybrid A* reached search limit ({_MAX_EXPANSIONS:,} nodes). "
-                "The scene may be geometrically infeasible for this car/lane combination."
-            )
-
-        cur_key = _discretise(x, y, theta)
-
-        # Stale heap entry — a cheaper path to this cell exists
-        if g > g_cost.get(cur_key, float('inf')) + 1e-6:
-            continue
-
-        # ── Goal check ────────────────────────────────────────────────────
-        dist = math.hypot(x - gx, y - gy)
-        dh   = abs((theta - gtheta + math.pi) % (2 * math.pi) - math.pi)
-        if dist < _GOAL_DIST and dh < _GOAL_HEADING:
-            return _backtrack(came_from, state_pos, cur_key, start_key), True, "OK"
-
-        # ── Expand neighbours ─────────────────────────────────────────────
-        for direction in dirs:
-            for delta in steers:
-                nx, ny, ntheta, sub_poses = _kinematic_step(
-                    x, y, theta, direction, delta,
-                    _GRID_RES, wb, _ARC_SUBSTEPS,
+            if self._reached_goal(current_pose, goal):
+                raw_wps = self._reconstruct(current_idx, nodes)
+                wps = self._smooth_path(raw_wps)
+                elapsed = time.perf_counter() - start_t
+                metrics = self._metrics(
+                    wps,
+                    goal,
+                    elapsed,
+                    iterations,
+                    len(nodes),
+                    raw_wps,
                 )
-                # Collision-check every sub-step
-                valid = True
-                for px, py, pt in sub_poses:
-                    if not _in_bounds(lot.car_corners((px, py, pt)), lane, spot):
-                        valid = False
-                        break
-                if not valid:
+                return TrajectoryResult(
+                    wps,
+                    True,
+                    f"Hybrid A*: OK in {elapsed:.2f}s, {iterations} iterations.",
+                    [0],
+                    ["Hybrid A* parking"],
+                    metrics,
+                )
+
+            shot = self._try_rs_shot(current_pose, goal, iterations)
+            if shot is not None:
+                base_wps = self._reconstruct(current_idx, nodes)
+                merged = self._merge_shot(base_wps, shot)
+                wps = self._smooth_path(merged)
+                elapsed = time.perf_counter() - start_t
+                metrics = self._metrics(
+                    wps,
+                    goal,
+                    elapsed,
+                    iterations,
+                    len(nodes),
+                    merged,
+                )
+                metrics["rs_shot_attempts"] = self.rs_shot_attempts
+                metrics["rs_shot_successes"] = self.rs_shot_successes
+                metrics["used_analytic_shot"] = True
+                return TrajectoryResult(
+                    wps,
+                    True,
+                    f"Hybrid A*+RS: OK in {elapsed:.2f}s, {iterations} iterations "
+                    f"(analytic shot).",
+                    [0],
+                    ["Hybrid A* + Reeds-Shepp parking"],
+                    metrics,
+                )
+
+            for pose, cost, direction, steer in self._expand(current):
+                idx = self._index(pose)
+                new_g = current.g + cost
+                if idx in closed:
+                    continue
+                if new_g >= best_cost.get(idx, float("inf")):
                     continue
 
-                move_cost = _GRID_RES * (_REVERSE_COST if direction == -1 else 1.0)
-                if last_dir != 0 and direction != last_dir:
-                    move_cost += _GEAR_PENALTY
-                ng = g + move_cost
+                best_cost[idx] = new_g
+                nodes[idx] = SearchNode(
+                    pose[0],
+                    pose[1],
+                    pose[2],
+                    new_g,
+                    current_idx,
+                    direction,
+                    steer,
+                )
+                counter += 1
+                f_score = new_g + self._heuristic(pose, goal)
+                heapq.heappush(open_heap, (f_score, counter, idx))
 
-                nkey = _discretise(nx, ny, ntheta)
-                if ng < g_cost.get(nkey, float('inf')):
-                    g_cost[nkey]    = ng
-                    state_pos[nkey] = (nx, ny, ntheta)
-                    came_from[nkey] = (cur_key, sub_poses, direction)
-                    h = _heuristic(nx, ny, ntheta, gx, gy, gtheta)
-                    counter += 1
-                    heapq.heappush(heap, (ng + h, ng, counter,
-                                          nx, ny, ntheta, direction))
+        return TrajectoryResult(
+            [],
+            False,
+            f"Hybrid A*: no path found within {self.max_iterations} iterations.",
+            [],
+            [],
+        )
 
-    return [], False, "No path found — target pose unreachable with current car/lane geometry."
+    def _expand(self, node: SearchNode) -> Iterable[Tuple[Pose, float, int, float]]:
+        for direction in (1, -1):
+            for steer in self.steering_set:
+                pose = self._simulate((node.x, node.y, node.theta), direction, steer)
+                if pose is None:
+                    continue
+
+                cost = self.motion_step
+                if direction < 0:
+                    cost *= 1.15
+                if node.direction and direction != node.direction:
+                    cost += 1.0
+                cost += 0.08 * abs(steer)
+                cost += 0.25 * abs(steer - node.steer)
+                yield pose, cost, direction, steer
+
+    def _simulate(self, start: Pose, direction: int, steer: float) -> Optional[Pose]:
+        x, y, theta = start
+        travelled = 0.0
+        while travelled < self.motion_step:
+            ds = min(self.integration_step, self.motion_step - travelled)
+            x += direction * ds * math.cos(theta)
+            y += direction * ds * math.sin(theta)
+            theta += direction * ds * math.tan(steer) / self.cc.wheelbase
+            theta = (theta + math.pi) % (2 * math.pi) - math.pi
+            travelled += ds
+            if not self.grid.pose_is_valid((x, y, theta)):
+                return None
+        return x, y, theta
+
+    def _index(self, pose: Pose) -> GridIndex:
+        x, y, theta = pose
+        ix = int(round(x / self.xy_resolution))
+        iy = int(round(y / self.xy_resolution))
+        ith = int(round(((theta + math.pi) % (2 * math.pi)) / (2 * math.pi) * self.theta_bins))
+        ith %= self.theta_bins
+        return GridIndex(ix, iy, ith)
+
+    def _heuristic(self, pose: Pose, goal: Pose) -> float:
+        dx = pose[0] - goal[0]
+        dy = pose[1] - goal[1]
+        dist = math.hypot(dx, dy)
+        dtheta = abs(_angle_diff(pose[2], goal[2]))
+        holonomic = dist + 0.4 * dtheta
+        # Reeds-Shepp gives a non-holonomic lower bound but is expensive.
+        # Use a cached lookup on a coarse grid so each pose costs O(1)
+        # after the first RS query in its bucket.
+        if dist < self.rs_shot_radius * 1.5:
+            key = (
+                int(round((pose[0] - goal[0]) / self._heuristic_xy)),
+                int(round((pose[1] - goal[1]) / self._heuristic_xy)),
+                int(round(
+                    _angle_diff(pose[2], goal[2])
+                    / (2 * math.pi)
+                    * self._heuristic_theta_bins
+                )),
+            )
+            rs_len = self._heuristic_cache.get(key)
+            if rs_len is None:
+                rs_len = reeds_shepp.path_length(pose, goal, self.rs_radius)
+                self._heuristic_cache[key] = rs_len
+            if math.isfinite(rs_len):
+                return max(holonomic, rs_len)
+        return holonomic
+
+    def _try_rs_shot(
+        self,
+        pose: Pose,
+        goal: Pose,
+        iterations: int,
+    ) -> Optional[List[Waypoint]]:
+        dist = math.hypot(pose[0] - goal[0], pose[1] - goal[1])
+        if dist > self.rs_shot_radius:
+            if iterations % self.rs_shot_interval != 0:
+                return None
+            if dist > self.rs_shot_radius * 2.5:
+                return None
+
+        self.rs_shot_attempts += 1
+        rs_path = reeds_shepp.shortest_path(pose, goal, self.rs_radius)
+        if rs_path is None:
+            return None
+        # Cap shot length to avoid validating very long segments far from goal
+        if rs_path.length > dist + 4.0 * self.rs_radius:
+            return None
+
+        samples = reeds_shepp.discretize(pose, rs_path, self.rs_radius, step=self.rs_step)
+        for x, y, theta, _ in samples:
+            if not self.grid.pose_is_valid((x, y, theta)):
+                return None
+
+        # Final pose must satisfy the same parking acceptance criteria
+        final = samples[-1]
+        if not self.grid.pose_is_fully_in_spot((final[0], final[1], final[2])):
+            return None
+
+        self.rs_shot_successes += 1
+        return [Waypoint(x, y, theta) for x, y, theta, _ in samples]
+
+    def _merge_shot(
+        self,
+        base_path: List[Waypoint],
+        shot: List[Waypoint],
+    ) -> List[Waypoint]:
+        if not base_path:
+            return list(shot)
+        # The shot starts at the last base waypoint; skip its first sample.
+        return list(base_path) + list(shot[1:])
+
+    def _reached_goal(self, pose: Pose, goal: Pose) -> bool:
+        dist = math.hypot(pose[0] - goal[0], pose[1] - goal[1])
+        heading_err = abs(_angle_diff(pose[2], goal[2]))
+        return (
+            dist <= self.goal_xy_tolerance
+            and heading_err <= self.goal_theta_tolerance
+            and self.grid.pose_is_fully_in_spot(pose)
+        )
+
+    def _reconstruct(
+        self,
+        goal_idx: GridIndex,
+        nodes: Dict[GridIndex, SearchNode],
+    ) -> List[Waypoint]:
+        path = []
+        idx: Optional[GridIndex] = goal_idx
+        while idx is not None:
+            node = nodes[idx]
+            path.append(Waypoint(node.x, node.y, node.theta))
+            idx = node.parent
+        path.reverse()
+        return path
+
+    def _segment_is_valid(self, a: Waypoint, b: Waypoint) -> bool:
+        dist = math.hypot(b.x - a.x, b.y - a.y)
+        steps = max(2, int(math.ceil(dist / 0.12)))
+        for i in range(steps + 1):
+            t = i / steps
+            x = a.x + (b.x - a.x) * t
+            y = a.y + (b.y - a.y) * t
+            theta = a.theta + _angle_diff(b.theta, a.theta) * t
+            if not self.grid.pose_is_valid((x, y, theta)):
+                return False
+        return True
+
+    def _smooth_path(self, waypoints: Sequence[Waypoint]) -> List[Waypoint]:
+        if len(waypoints) <= 2:
+            return list(waypoints)
+
+        cleaned = [waypoints[0]]
+        for wp in waypoints[1:]:
+            prev = cleaned[-1]
+            if math.hypot(wp.x - prev.x, wp.y - prev.y) < 0.05:
+                continue
+            cleaned.append(wp)
+
+        if len(cleaned) <= 2:
+            return cleaned
+
+        smoothed = [cleaned[0]]
+        for i in range(1, len(cleaned) - 1):
+            a = smoothed[-1]
+            b = cleaned[i]
+            c = cleaned[i + 1]
+            ab = math.atan2(b.y - a.y, b.x - a.x)
+            bc = math.atan2(c.y - b.y, c.x - b.x)
+            heading_change = abs(_angle_diff(ab, bc))
+            car_heading_change = abs(_angle_diff(c.theta, a.theta))
+            if (
+                heading_change < math.radians(7)
+                and car_heading_change < math.radians(10)
+                and self._segment_is_valid(a, c)
+            ):
+                continue
+            smoothed.append(b)
+        smoothed.append(cleaned[-1])
+        return smoothed
+
+    def _path_length(self, waypoints: Sequence[Waypoint]) -> float:
+        return sum(
+            math.hypot(b.x - a.x, b.y - a.y)
+            for a, b in zip(waypoints, waypoints[1:])
+        )
+
+    def _metrics(
+        self,
+        waypoints: Sequence[Waypoint],
+        goal: Pose,
+        planning_time_s: float,
+        iterations: int,
+        expanded_states: int,
+        raw_waypoints: Optional[Sequence[Waypoint]] = None,
+    ) -> dict:
+        raw_waypoints = raw_waypoints or waypoints
+        path_length = self._path_length(waypoints)
+        raw_path_length = self._path_length(raw_waypoints)
+
+        final = waypoints[-1]
+        final_pose = (final.x, final.y, final.theta)
+        final_pos_error = math.hypot(final.x - goal[0], final.y - goal[1])
+        final_heading_error = abs(_angle_diff(final.theta, goal[2]))
+
+        return {
+            "planning_time_s": planning_time_s,
+            "iterations": iterations,
+            "expanded_states": expanded_states,
+            "path_length_m": path_length,
+            "raw_path_length_m": raw_path_length,
+            "smoothed_path_length_m": path_length,
+            "waypoints": len(waypoints),
+            "raw_waypoints": len(raw_waypoints),
+            "smoothed_waypoints": len(waypoints),
+            "final_pos_error_m": final_pos_error,
+            "final_heading_error_deg": math.degrees(final_heading_error),
+            "fully_in_spot": self.grid.pose_is_fully_in_spot(final_pose, margin=0.0),
+            "obstacles": len(self.grid.obstacles),
+        }
+
+
+def perpendicular_goal_pose(lot: ParkingLot) -> Pose:
+    """Return a rear-axle goal pose centered inside a perpendicular spot."""
+    spot = lot.spot_rect
+    x = spot.x + spot.w / 2
+    y = spot.top - 0.15
+    theta = -math.pi / 2
+    return x, y, theta
+
+
+def parallel_goal_pose(lot: ParkingLot) -> Pose:
+    """Return a rear-axle goal pose inside a parallel spot."""
+    spot = lot.spot_rect
+    x = spot.x + 0.15
+    y = spot.y + spot.h / 2
+    theta = 0.0
+    return x, y, theta
+
+
+def plan_hybrid_astar(
+    pc: ParkingConfig,
+    cc: CarConfig,
+    obstacles: Optional[Sequence[Rect]] = None,
+) -> TrajectoryResult:
+    lot = ParkingLot(pc, cc)
+    active_obstacles = list(obstacles) if obstacles is not None else obstacles_for(lot)
+    grid = OccupancyGrid(lot, obstacles=active_obstacles)
+    planner = HybridAStarPlanner(lot, cc, grid)
+    if pc.parking_type == "perpendicular":
+        goal = perpendicular_goal_pose(lot)
+    elif pc.parking_type == "parallel":
+        goal = parallel_goal_pose(lot)
+    else:
+        return TrajectoryResult([], False, f"Hybrid A*: unknown parking type {pc.parking_type!r}.")
+
+    result = planner.plan(lot.car_start_pose, goal)
+    if result.phase_names:
+        result.phase_names[0] = (
+            "Hybrid A* perpendicular parking"
+            if pc.parking_type == "perpendicular"
+            else "Hybrid A* parallel parking"
+        )
+    return result

@@ -9,13 +9,20 @@ from typing import Optional, Tuple
 
 from config import CarConfig, ParkingConfig
 from parking_lot import ParkingLot
+from scenarios import obstacles_for
 
-COLOR_LANE      = "#9e9e9e"
-COLOR_SPOT_OK   = "#ffffff"
+COLOR_LANE      = "#737a84"
+COLOR_SPOT_OK   = "#7dd3fc"
 COLOR_SPOT_ERR  = "#ff5252"
-COLOR_CAR       = "#1976d2"
-COLOR_CAR_FRONT = "#0d47a1"
-COLOR_BG        = "#f5f5f5"
+COLOR_CAR       = "#3b82f6"
+COLOR_CAR_FRONT = "#1d4ed8"
+COLOR_BG        = "#161a20"
+COLOR_PANEL     = "#20262e"
+COLOR_PANEL_2   = "#252c35"
+COLOR_TEXT      = "#f3f6fb"
+COLOR_MUTED     = "#a8b3c2"
+COLOR_BORDER    = "#3a4552"
+COLOR_ACCENT    = "#3b82f6"
 
 # (display label, var attribute name, slider min, slider max, default)
 SLIDER_DEFS = [
@@ -60,11 +67,14 @@ class SettingsWindow:
         self.var_car_len  = tk.DoubleVar(value=cc.length       if cc else 4.2)
         self.var_car_w    = tk.DoubleVar(value=cc.width        if cc else 1.8)
         self.var_type     = tk.StringVar(value=pc.parking_type if pc else "perpendicular")
+        self.var_obstacle = tk.StringVar(value=pc.obstacle_scenario if pc else "none")
         self.var_planner  = tk.StringVar(value=pc.planner      if pc else "single")
 
         for *_, attr, _min, _max, _def in SLIDER_DEFS:
             getattr(self, attr).trace_add("write", self._on_change)
         self.var_type.trace_add("write", self._on_change)
+        self.var_obstacle.trace_add("write", self._on_change)
+        self.var_planner.trace_add("write", self._on_change)
 
     # ------------------------------------------------------------------
     # UI layout
@@ -77,87 +87,159 @@ class SettingsWindow:
         root.rowconfigure(1, weight=1)
 
         tk.Label(root, text="Smart Parking Simulator",
-                 font=("Arial", 15, "bold"), bg=COLOR_BG).grid(
+                 font=("Arial", 15, "bold"),
+                 bg=COLOR_BG, fg=COLOR_TEXT).grid(
             row=0, column=0, columnspan=2, pady=(12, 8))
 
         # ---- Left panel: sliders (fixed width) ----
-        left = tk.Frame(root, bg=COLOR_BG, padx=14)
-        left.grid(row=1, column=0, sticky="nw")
+        left = tk.Frame(root, bg=COLOR_PANEL, padx=14, pady=8,
+                        highlightthickness=1, highlightbackground=COLOR_BORDER)
+        left.grid(row=1, column=0, sticky="nw", padx=(14, 8))
 
         for i, (label, attr, from_, to, _) in enumerate(SLIDER_DEFS):
             var = getattr(self, attr)
-            tk.Label(left, text=label, bg=COLOR_BG,
+            tk.Label(left, text=label, bg=COLOR_PANEL, fg=COLOR_TEXT,
                      font=("Arial", 11), anchor="w").grid(
                 row=i * 2, column=0, sticky="w", pady=(10, 0))
-            row_frame = tk.Frame(left, bg=COLOR_BG)
+            row_frame = tk.Frame(left, bg=COLOR_PANEL)
             row_frame.grid(row=i * 2 + 1, column=0, sticky="ew")
             tk.Scale(row_frame, variable=var, from_=from_, to=to,
                      resolution=0.1, orient=tk.HORIZONTAL,
                      length=260, showvalue=False,
-                     bg=COLOR_BG, highlightthickness=0,
-                     troughcolor="#bbbbbb",
-                     activebackground="#1976d2").pack(side="left")
+                     bg=COLOR_PANEL, fg=COLOR_TEXT,
+                     highlightthickness=0,
+                     troughcolor="#384250",
+                     activebackground=COLOR_ACCENT).pack(side="left")
             tk.Label(row_frame, textvariable=var, width=5,
-                     bg=COLOR_BG, font=("Arial", 11)).pack(
+                     bg=COLOR_PANEL, fg=COLOR_MUTED,
+                     font=("Arial", 11)).pack(
                 side="left", padx=(6, 0))
 
         n = len(SLIDER_DEFS)
-        tk.Label(left, text="Parking Type", bg=COLOR_BG,
+        tk.Label(left, text="Parking Type", bg=COLOR_PANEL, fg=COLOR_TEXT,
                  font=("Arial", 11)).grid(
             row=n * 2, column=0, sticky="w", pady=(14, 2))
-        type_frame = tk.Frame(left, bg=COLOR_BG)
+        type_frame = tk.Frame(left, bg=COLOR_PANEL)
         type_frame.grid(row=n * 2 + 1, column=0, sticky="w")
         tk.Radiobutton(type_frame, text="Reverse into Spot",
                        variable=self.var_type, value="perpendicular",
-                       bg=COLOR_BG, font=("Arial", 11)).pack(
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
             side="left", padx=4)
         tk.Radiobutton(type_frame, text="Parallel Parking",
                        variable=self.var_type, value="parallel",
-                       bg=COLOR_BG, font=("Arial", 11)).pack(
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
             side="left", padx=4)
 
-        tk.Label(left, text="Planner", bg=COLOR_BG,
+        tk.Label(left, text="Scenario", bg=COLOR_PANEL, fg=COLOR_TEXT,
                  font=("Arial", 11)).grid(
             row=n * 2 + 2, column=0, sticky="w", pady=(14, 2))
-        planner_frame = tk.Frame(left, bg=COLOR_BG)
-        planner_frame.grid(row=n * 2 + 3, column=0, sticky="w")
+        scenario_frame = tk.Frame(left, bg=COLOR_PANEL)
+        scenario_frame.grid(row=n * 2 + 3, column=0, sticky="w")
+        tk.Radiobutton(scenario_frame, text="Clear",
+                       variable=self.var_obstacle, value="none",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(scenario_frame, text="Obstacle",
+                       variable=self.var_obstacle, value="entry_blocker",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(scenario_frame, text="Tight",
+                       variable=self.var_obstacle, value="tight_lane",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(scenario_frame, text="Parked Cars",
+                       variable=self.var_obstacle, value="parked_cars",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+
+        tk.Label(left, text="Planner", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                 font=("Arial", 11)).grid(
+            row=n * 2 + 4, column=0, sticky="w", pady=(14, 2))
+        planner_frame = tk.Frame(left, bg=COLOR_PANEL)
+        planner_frame.grid(row=n * 2 + 5, column=0, sticky="w")
         tk.Radiobutton(planner_frame, text="Single-step MPC",
                        variable=self.var_planner, value="single",
-                       bg=COLOR_BG, font=("Arial", 11)).pack(
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
             side="left", padx=4)
         tk.Radiobutton(planner_frame, text="Multi-step MPC",
                        variable=self.var_planner, value="multi",
-                       bg=COLOR_BG, font=("Arial", 11)).pack(
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
             side="left", padx=4)
         tk.Radiobutton(planner_frame, text="Hybrid A*",
-                       variable=self.var_planner, value="hastar",
-                       bg=COLOR_BG, font=("Arial", 11)).pack(
+                       variable=self.var_planner, value="hybrid_astar",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(planner_frame, text="Q-learning (RL)",
+                       variable=self.var_planner, value="qlearn",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
             side="left", padx=4)
 
         # ---- Right panel: expandable canvas ----
-        right = tk.Frame(root, bg=COLOR_BG, padx=8, pady=6)
-        right.grid(row=1, column=1, sticky="nsew")
+        right = tk.Frame(root, bg=COLOR_PANEL, padx=10, pady=8,
+                         highlightthickness=1, highlightbackground=COLOR_BORDER)
+        right.grid(row=1, column=1, sticky="nsew", padx=(0, 14))
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)   # canvas row expands
 
         tk.Label(right, text="Live Preview", font=("Arial", 11, "bold"),
-                 bg=COLOR_BG).grid(row=0, column=0, sticky="w")
+                 bg=COLOR_PANEL, fg=COLOR_TEXT).grid(row=0, column=0, sticky="w")
 
-        self.canvas = tk.Canvas(right, bg="#2e2e2e",
+        self.canvas = tk.Canvas(right, bg="#11151b",
                                 highlightthickness=1,
-                                highlightbackground="#aaa")
+                                highlightbackground=COLOR_BORDER)
         self.canvas.grid(row=1, column=0, sticky="nsew",
                          padx=4, pady=(4, 2))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
         self.status_var = tk.StringVar(value="")
         tk.Label(right, textvariable=self.status_var, fg="#e53935",
-                 bg=COLOR_BG, font=("Arial", 9)).grid(
+                 bg=COLOR_PANEL, font=("Arial", 9)).grid(
             row=2, column=0, sticky="w")
 
         # ---- Start button: full width at the bottom ----
         tk.Button(root, text="Start Simulation", command=self._on_confirm,
-                  font=("Arial", 13, "bold"), bg="#1976d2", fg="white",
+                  font=("Arial", 13, "bold"), bg=COLOR_ACCENT, fg="white",
+                  activebackground="#2563eb", activeforeground="white",
                   relief="flat", padx=16, pady=8).grid(
             row=2, column=0, columnspan=2, pady=(16, 14))
 
@@ -190,6 +272,7 @@ class SettingsWindow:
             spot_length=slider_map["var_spot_len"],
             spot_width=slider_map["var_spot_w"],
             parking_type=parking_type,
+            obstacle_scenario=self.var_obstacle.get(),
         )
         cc = CarConfig(
             length=slider_map["var_car_len"],
@@ -234,16 +317,24 @@ class SettingsWindow:
         sx2, sy2 = w2c(sr.right, sr.y)
         spot_color = COLOR_SPOT_OK if fits else COLOR_SPOT_ERR
         c.create_rectangle(sx1, sy1, sx2, sy2,
-                            fill="#444444", outline=spot_color,
+                            fill="#2b323c", outline=spot_color,
                             width=2, dash=(6, 4))
         c.create_text((sx1 + sx2) / 2, (sy1 + sy2) / 2,
                       text="Spot", fill=spot_color, font=("Arial", 10))
+
+        # Static obstacles / occupied cells
+        for obs in obstacles_for(lot):
+            ox1, oy1 = w2c(obs.x, obs.top)
+            ox2, oy2 = w2c(obs.right, obs.y)
+            c.create_rectangle(ox1, oy1, ox2, oy2,
+                               fill="#dc2626", outline="#fecaca",
+                               width=1)
 
         # Car body (blue rectangle)
         corners = lot.car_corners(lot.car_start_pose)
         pts = [w2c(wx, wy) for wx, wy in corners]
         flat = [coord for pt in pts for coord in pt]
-        c.create_polygon(flat, fill=COLOR_CAR, outline="#ffffff", width=1)
+        c.create_polygon(flat, fill=COLOR_CAR, outline="#dbeafe", width=1)
         # Front edge (darker) — corners[1] and corners[2]
         c.create_line(*pts[1], *pts[2], fill=COLOR_CAR_FRONT, width=3)
 
@@ -252,11 +343,11 @@ class SettingsWindow:
         _, ly_bot = w2c(0, r.y)
         _, ly_top = w2c(0, r.top)
         c.create_line(lx - 8, ly_bot, lx - 8, ly_top,
-                      fill="#eeeeee", width=1, arrow=tk.BOTH,
+                      fill=COLOR_MUTED, width=1, arrow=tk.BOTH,
                       arrowshape=(5, 7, 3))
         c.create_text(lx - 20, (ly_bot + ly_top) / 2,
                       text=f"{lot.pc.lane_width:.1f}m",
-                      fill="#eeeeee", font=("Arial", 9), angle=90)
+                      fill=COLOR_MUTED, font=("Arial", 9), angle=90)
 
     # ------------------------------------------------------------------
     # Confirm
@@ -280,6 +371,7 @@ class SettingsWindow:
             spot_length=round(self.var_spot_len.get(), 1),
             spot_width=round(self.var_spot_w.get(), 1),
             parking_type=self.var_type.get(),
+            obstacle_scenario=self.var_obstacle.get(),
             planner=self.var_planner.get(),
         )
 

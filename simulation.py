@@ -1,7 +1,8 @@
 """
 Phase 2: pygame simulation window.
 Animates the computed parking trajectory.
-Controls: SPACE pause/resume  |  R restart  |  ESC/Q quit
+Controls: SPACE pause/resume  |  R restart  |  G grid overlay  |  T track overlay
+          ESC/Q quit          |  S back to settings
 """
 import math
 import os
@@ -9,10 +10,12 @@ import os
 import pygame
 
 from config import CarConfig, ParkingConfig
+from hybrid_astar import OccupancyGrid
 from parking_lot import ParkingLot
+from scenarios import obstacles_for
 from trajectory import TrajectoryResult, plan_trajectory
 
-WIN_W, WIN_H = 960, 640
+WIN_W, WIN_H = 1080, 720
 
 # Colours
 C_BG         = (30,  30,  30)
@@ -25,7 +28,12 @@ C_TEXT       = (240, 240, 240)
 C_DIM        = (160, 160, 160)
 C_PATH_PLAN  = (80,  160, 255)   # full planned path
 C_PATH_DONE  = (80,  220, 120)   # already-travelled portion
+C_PATH_EXEC  = (250, 200,  80)   # executed (closed-loop) path
+C_GRID_FREE  = (70,   85, 110)
+C_GRID_BLOCK = (200,  90,  90)
 C_WARN       = (255,  80,  80)
+C_OBSTACLE   = (190,  45,  45)
+C_OBS_LINE   = (255, 190, 190)
 
 # Waypoints advanced per frame (controls animation speed)
 SPEED = 2
@@ -37,7 +45,54 @@ class Simulation:
         self.cc  = car_config
         self.lot = ParkingLot(parking_config, car_config)
         self._compute_scale()
-        self.result: TrajectoryResult = plan_trajectory(parking_config, car_config)
+        # Resolve the requested planner: env var > Settings UI choice. We
+        # normalise the legacy "baseline" alias to the concrete MPC variant
+        # so plan_trajectory dispatches deterministically and the HUD label
+        # matches what actually ran. AUTOPARK_PLANNER=baseline means
+        # "single-step MPC" (the original baseline); to fall back to the
+        # Settings UI choice, leave AUTOPARK_PLANNER unset.
+        env_planner = os.environ.get("AUTOPARK_PLANNER")
+        if env_planner:
+            requested_planner = env_planner
+            if requested_planner == "baseline":
+                requested_planner = "single"
+        else:
+            requested_planner = parking_config.planner or "single"
+        self.planner_name = self._effective_planner_name(requested_planner)
+
+        track_env = os.environ.get("AUTOPARK_TRACK", "")
+        self.track_enabled = track_env.lower() in ("1", "true", "yes", "on")
+
+        self.result: TrajectoryResult = plan_trajectory(
+            parking_config,
+            car_config,
+            planner=requested_planner,
+            track=self.track_enabled,
+        )
+        self.animation_speed = 1 if parking_config.parking_type == "parallel" else SPEED
+
+        # UI toggles
+        self.show_grid = False
+        self.show_executed = bool(self.result.executed_waypoints)
+
+        # Build a lightweight occupancy grid for visualization regardless of
+        # planner. Cache the obstacle list so per-frame drawing does not
+        # re-run scenario dispatch + list allocation 60 times per second.
+        self._obstacles = obstacles_for(self.lot)
+        self._viz_grid = OccupancyGrid(
+            self.lot,
+            resolution=0.5,
+            obstacles=self._obstacles,
+        )
+
+    def _effective_planner_name(self, requested_planner: str) -> str:
+        if requested_planner == "hybrid_astar":
+            return "hybrid_astar"
+        if requested_planner == "qlearn":
+            return "qlearn (RL)"
+        if self.pc.parking_type == "parallel" or self.pc.obstacle_scenario != "none":
+            return "hybrid_astar"
+        return requested_planner
 
     # ------------------------------------------------------------------
     # Coordinate transform
@@ -96,16 +151,60 @@ class Simulation:
         wps = self.result.waypoints
         if len(wps) < 2:
             return
-        # Full planned path (thin, semi-transparent look via colour)
+        # Full planned path (thin)
         all_pts = [self.w2s(w.x, w.y) for w in wps]
         pygame.draw.lines(surf, C_PATH_PLAN, False, all_pts, 1)
         # Travelled portion (thicker green)
         done_pts = all_pts[:step + 1]
         if len(done_pts) > 1:
             pygame.draw.lines(surf, C_PATH_DONE, False, done_pts, 3)
+        # Executed (closed-loop) trajectory overlay
+        if self.show_executed and self.result.executed_waypoints:
+            exec_pts = [
+                self.w2s(w.x, w.y) for w in self.result.executed_waypoints
+            ]
+            if len(exec_pts) > 1:
+                pygame.draw.lines(surf, C_PATH_EXEC, False, exec_pts, 2)
+
+    def _draw_grid(self, surf):
+        """Overlay the occupancy grid.
+
+        Free cells are rendered once into a cached background surface (built
+        on first toggle) and blitted thereafter. Blocked cells are drawn on
+        top each frame so changes (if obstacles ever become dynamic) update
+        live without rebuilding the cache.
+        """
+        if not self.show_grid:
+            return
+        g = self._viz_grid
+        res = g.resolution
+        if getattr(self, "_grid_cache", None) is None:
+            cache = pygame.Surface((WIN_W, WIN_H), flags=pygame.SRCALPHA)
+            for ix in range(g.width):
+                for iy in range(g.height):
+                    x = g.min_x + ix * res
+                    y = g.min_y + iy * res
+                    x1, y1 = self.w2s(x, y + res)
+                    x2, y2 = self.w2s(x + res, y)
+                    rect = pygame.Rect(min(x1, x2), min(y1, y2),
+                                       abs(x2 - x1), abs(y2 - y1))
+                    pygame.draw.rect(cache, C_GRID_FREE, rect, 1)
+            self._grid_cache = cache
+        surf.blit(self._grid_cache, (0, 0))
+        for ix, iy in g.blocked:
+            x = g.min_x + ix * res
+            y = g.min_y + iy * res
+            x1, y1 = self.w2s(x, y + res)
+            x2, y2 = self.w2s(x + res, y)
+            rect = pygame.Rect(min(x1, x2), min(y1, y2),
+                               abs(x2 - x1), abs(y2 - y1))
+            pygame.draw.rect(surf, C_GRID_BLOCK, rect, 1)
 
     def _draw_scene(self, surf, step: int):
         surf.fill(C_BG)
+
+        # Occupancy-grid overlay (toggled by G)
+        self._draw_grid(surf)
 
         # Lane
         r = self.lot.lane_rect
@@ -126,6 +225,14 @@ class Simulation:
         font_s = pygame.font.SysFont("Arial", 15)
         lbl = font_s.render("Spot", True, C_SPOT_LINE)
         surf.blit(lbl, lbl.get_rect(center=spot_r.center))
+
+        for obs in self._obstacles:
+            ox1, oy1 = self.w2s(obs.x, obs.top)
+            ox2, oy2 = self.w2s(obs.right, obs.y)
+            obs_r = pygame.Rect(min(ox1, ox2), min(oy1, oy2),
+                                abs(ox2 - ox1), abs(oy2 - oy1))
+            pygame.draw.rect(surf, C_OBSTACLE, obs_r)
+            pygame.draw.rect(surf, C_OBS_LINE, obs_r, 1)
 
         # Planned path + travelled path
         self._draw_path(surf, step)
@@ -151,17 +258,22 @@ class Simulation:
         wps    = self.result.waypoints
         total  = max(len(wps) - 1, 1)
 
-        # Determine current phase name
+        # Determine current phase name. Guard against any planner that
+        # returns mismatched-length phase_starts/phase_names so the per-frame
+        # HUD draw cannot raise IndexError and kill the pygame loop.
         phase_name = ""
+        names = self.result.phase_names
         for i, ps in enumerate(self.result.phase_starts):
-            if step >= ps:
-                phase_name = self.result.phase_names[i]
+            if step >= ps and i < len(names):
+                phase_name = names[i]
 
         type_label = ("Reverse into Spot" if self.pc.parking_type == "perpendicular"
                       else "Parallel Parking")
 
         lines = [
             (font_b, f"Parking type: {type_label}",                 C_TEXT),
+            (font,   f"Planner: {self.planner_name}",                C_DIM),
+            (font,   f"Scenario: {self.pc.obstacle_scenario}",        C_DIM),
             (font,   f"Lane: {self.pc.lane_width:.1f} m  |  "
                      f"Spot: {self.pc.spot_length:.1f}x{self.pc.spot_width:.1f} m  |  "
                      f"Car: {self.cc.length:.1f}x{self.cc.width:.1f} m",  C_DIM),
@@ -171,20 +283,74 @@ class Simulation:
         collision_frame = (not self.result.feasible
                            and bool(wps)
                            and step >= total)
+        metrics = self.result.metrics
+        status = "SUCCESS" if self.result.feasible else "FAILED"
+        status_color = C_PATH_DONE if self.result.feasible else C_WARN
+        full_spot = metrics.get("fully_in_spot", False)
+
+        lines.append((font_b, f"Status: {status}", status_color))
+        lines.append((font, f"Phase: {phase_name}", C_TEXT))
+        lines.append((font, f"Step: {min(step, total)} / {total}", C_DIM))
+        if metrics:
+            lines.append((
+                font,
+                f"Path: {metrics.get('path_length_m', 0.0):.1f} m  |  "
+                f"Plan: {metrics.get('planning_time_s', 0.0):.2f}s  |  "
+                f"Final err: {metrics.get('final_pos_error_m', 0.0):.2f} m",
+                C_DIM,
+            ))
+            lines.append((
+                font,
+                f"Heading err: {metrics.get('final_heading_error_deg', 0.0):.1f} deg  |  "
+                f"Fully in spot: {full_spot}",
+                C_DIM,
+            ))
+            if metrics.get("used_analytic_shot"):
+                lines.append((
+                    font,
+                    f"Reeds-Shepp shot: {metrics.get('rs_shot_successes', 0)} "
+                    f"/ {metrics.get('rs_shot_attempts', 0)} attempts",
+                    C_PATH_EXEC,
+                ))
+            if metrics.get("planner_kind") == "qlearn":
+                lines.append((
+                    font,
+                    f"RL: trained {metrics.get('training_time_s', 0):.1f}s, "
+                    f"{metrics.get('successful_episodes', 0)} success eps, "
+                    f"{metrics.get('expanded_states', 0)} states",
+                    C_PATH_EXEC,
+                ))
+
+        tm = self.result.tracking_metrics or {}
+        if tm:
+            lines.append((font_b, "Pure Pursuit (closed loop):", C_PATH_EXEC))
+            lines.append((
+                font,
+                f"  CTE mean {tm.get('mean_cte_m', 0):.3f} m  |  "
+                f"max {tm.get('max_cte_m', 0):.3f} m  |  "
+                f"cusps {tm.get('cusps', 0)}",
+                C_DIM,
+            ))
+            lines.append((
+                font,
+                f"  exec err {tm.get('exec_final_pos_error_m', 0):.3f} m  |  "
+                f"in spot: {tm.get('exec_fully_in_spot')}",
+                C_DIM,
+            ))
+
         if not self.result.feasible:
             lines.append((font_b, f"[!] {self.result.message}", C_WARN))
             if collision_frame:
                 font_big = pygame.font.SysFont("Arial", 36, bold=True)
-                label = font_big.render("COLLISION", True, C_WARN)
+                label = font_big.render("FAILED", True, C_WARN)
                 surf.blit(label, label.get_rect(
                     center=(WIN_W // 2, WIN_H // 2)))
-        else:
-            lines.append((font, f"Phase: {phase_name}", C_TEXT))
-            lines.append((font, f"Step: {min(step, total)} / {total}", C_DIM))
 
         lines += [
             (font, "SPACE  pause / resume", (100, 100, 100)),
             (font, "R      restart",        (100, 100, 100)),
+            (font, "G      toggle grid",    (100, 100, 100)),
+            (font, "T      toggle executed",(100, 100, 100)),
             (font, "S      back to settings",(100, 100, 100)),
             (font, "ESC    quit",           (100, 100, 100)),
         ]
@@ -225,9 +391,13 @@ class Simulation:
                     elif event.key == pygame.K_s:
                         go_back = True
                         running = False
+                    elif event.key == pygame.K_g:
+                        self.show_grid = not self.show_grid
+                    elif event.key == pygame.K_t:
+                        self.show_executed = not self.show_executed
 
             if not paused and step < total:
-                step = min(step + SPEED, total)
+                step = min(step + self.animation_speed, total)
 
             self._draw_scene(screen, step)
             pygame.display.flip()

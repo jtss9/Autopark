@@ -534,7 +534,14 @@ def plan_hybrid_astar(
     else:
         return TrajectoryResult([], False, f"Hybrid A*: unknown parking type {pc.parking_type!r}.")
 
+    print("Planning Hybrid A* trajectory...", end="", flush=True)
+    t0 = time.perf_counter()
     result = planner.plan(lot.car_start_pose, goal)
+    elapsed = time.perf_counter() - t0
+    if result.feasible:
+        print(f" done in {elapsed:.1f}s ({len(result.waypoints)} waypoints)")
+    else:
+        print(f" failed ({elapsed:.1f}s): {result.message}")
     if result.phase_names:
         result.phase_names[0] = (
             "Hybrid A* perpendicular parking"

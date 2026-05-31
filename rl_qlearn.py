@@ -307,6 +307,7 @@ def plan_qlearn(
             [], False, f"Q-learn: unknown parking type {pc.parking_type!r}.")
 
     planner = QLearningPlanner(lot, cc, grid, cfg)
+    print("Planning Q-learning trajectory...", end="", flush=True)
     train_t = time.perf_counter()
     planner.train(lot.car_start_pose, goal)
     train_elapsed = time.perf_counter() - train_t
@@ -343,6 +344,12 @@ def plan_qlearn(
         "obstacles": len(obstacles),
         "planner_kind": "qlearn",
     }
+    total_elapsed = train_elapsed + rollout_elapsed
+    if success:
+        print(f" done in {total_elapsed:.1f}s "
+              f"(train {train_elapsed:.1f}s, {len(path)} waypoints)")
+    else:
+        print(f" failed ({total_elapsed:.1f}s): {final_message}")
     return TrajectoryResult(
         waypoints=path,
         feasible=success,

@@ -47,6 +47,7 @@ class SettingsWindow:
         self.root.configure(bg=COLOR_BG)
         self.root.resizable(True, True)
         self.root.geometry("1100x680")
+        self.root.bind("<Return>", lambda _: self._on_confirm())
         self.root.minsize(800, 520)
 
         self._init_vars()

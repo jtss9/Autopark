@@ -35,8 +35,12 @@ C_WARN       = (255,  80,  80)
 C_OBSTACLE   = (190,  45,  45)
 C_OBS_LINE   = (255, 190, 190)
 
-# Waypoints advanced per frame (controls animation speed)
-SPEED = 2
+# Animation speed: waypoints advanced per frame (float; supports sub-1 for slow-mo)
+SPEED         = 2.0
+SPEED_MIN     = 0.05
+SPEED_MAX     = 10.0
+SPEED_STEP_UP = 2.0   # multiply on each ↑ press
+SPEED_STEP_DN = 0.5   # multiply on each ↓ press
 
 
 class Simulation:
@@ -69,7 +73,7 @@ class Simulation:
             planner=requested_planner,
             track=self.track_enabled,
         )
-        self.animation_speed = 1 if parking_config.parking_type == "parallel" else SPEED
+        self.animation_speed: float = 1.0 if parking_config.parking_type == "parallel" else SPEED
 
         # UI toggles
         self.show_grid = False
@@ -347,12 +351,14 @@ class Simulation:
                     center=(WIN_W // 2, WIN_H // 2)))
 
         lines += [
-            (font, "SPACE  pause / resume", (100, 100, 100)),
-            (font, "R      restart",        (100, 100, 100)),
-            (font, "G      toggle grid",    (100, 100, 100)),
-            (font, "T      toggle executed",(100, 100, 100)),
+            (font, f"Speed: {self.animation_speed:.2g}x  (↑↓ to adjust)", C_DIM),
+            (font, "SPACE  pause / resume",  (100, 100, 100)),
+            (font, "R      restart",         (100, 100, 100)),
+            (font, "↑ ↓    speed up / down", (100, 100, 100)),
+            (font, "G      toggle grid",     (100, 100, 100)),
+            (font, "T      toggle executed", (100, 100, 100)),
             (font, "S      back to settings",(100, 100, 100)),
-            (font, "ESC    quit",           (100, 100, 100)),
+            (font, "ESC    quit",            (100, 100, 100)),
         ]
 
         y = 12
@@ -370,9 +376,10 @@ class Simulation:
         screen = pygame.display.set_mode((WIN_W, WIN_H))
         clock  = pygame.time.Clock()
 
-        step   = 0
-        paused = False
-        total  = max(len(self.result.waypoints) - 1, 0)
+        step      = 0
+        step_acc  = 0.0   # fractional accumulator for sub-1 speeds
+        paused    = False
+        total     = max(len(self.result.waypoints) - 1, 0)
 
         go_back = False
         running = True
@@ -386,8 +393,9 @@ class Simulation:
                     elif event.key == pygame.K_SPACE:
                         paused = not paused
                     elif event.key == pygame.K_r:
-                        step   = 0
-                        paused = False
+                        step     = 0
+                        step_acc = 0.0
+                        paused   = False
                     elif event.key == pygame.K_s:
                         go_back = True
                         running = False
@@ -395,9 +403,16 @@ class Simulation:
                         self.show_grid = not self.show_grid
                     elif event.key == pygame.K_t:
                         self.show_executed = not self.show_executed
+                    elif event.key in (pygame.K_UP, pygame.K_EQUALS, pygame.K_PLUS):
+                        self.animation_speed = min(
+                            self.animation_speed * SPEED_STEP_UP, SPEED_MAX)
+                    elif event.key in (pygame.K_DOWN, pygame.K_MINUS):
+                        self.animation_speed = max(
+                            self.animation_speed * SPEED_STEP_DN, SPEED_MIN)
 
             if not paused and step < total:
-                step = min(step + self.animation_speed, total)
+                step_acc += self.animation_speed
+                step      = min(int(step_acc), total)
 
             self._draw_scene(screen, step)
             pygame.display.flip()

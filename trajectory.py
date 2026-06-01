@@ -16,6 +16,7 @@ from typing import List, Optional
 from config import CarConfig, ParkingConfig
 from geom import angle_diff as _angle_diff, path_length as _path_length
 from parking_lot import ParkingLot
+from scenarios import obstacles_for
 
 
 @dataclass
@@ -56,20 +57,30 @@ def plan_trajectory(
     if effective == "qlearn":
         from rl_qlearn import plan_qlearn
         result = plan_qlearn(pc, cc)
+    elif effective == "hrl":
+        from rl_hierarchical import plan_hierarchical_rl
+        result = plan_hierarchical_rl(pc, cc)
+    elif effective == "dqn":
+        from rl_dqn import plan_dqn
+        result = plan_dqn(pc, cc)
+    elif effective == "rrt_star":
+        from rrt_star import plan_rrt_star
+        result = plan_rrt_star(pc, cc)
     elif effective == "hybrid_astar":
         from hybrid_astar import plan_hybrid_astar
         result = plan_hybrid_astar(pc, cc)
-    elif pc.obstacle_scenario != "none":
-        # MPC backends have no obstacle awareness; auto-promote to Hybrid A*
-        # for any non-empty scenario so we never produce a colliding plan.
-        from hybrid_astar import plan_hybrid_astar
-        result = plan_hybrid_astar(pc, cc)
     elif pc.parking_type == "perpendicular":
+        # The MPC backends have no obstacle avoidance — their cost function
+        # never sees the obstacle list. We run them as requested even under a
+        # scenario (so the planner choice is honoured), but they now *detect*
+        # a body-obstacle collision and fail, rather than promote to Hybrid A*.
         if effective == "multi":
             result = _plan_perpendicular_multistep(pc, cc)
         else:
             result = _plan_perpendicular_mpc(pc, cc)
     elif pc.parking_type == "parallel":
+        # Parallel parking is Hybrid A*-only (the MPC planners are
+        # perpendicular-specific), so an MPC request still routes here.
         from hybrid_astar import plan_hybrid_astar
         result = plan_hybrid_astar(pc, cc)
     else:
@@ -104,14 +115,21 @@ def _attach_tracker(
     }
 
 
-def _densify_for_tracking(
+def densify_waypoints(
     waypoints: List[Waypoint],
     max_step: float = 0.15,
-) -> List[Waypoint]:
-    """Insert intermediate samples so consecutive waypoints stay within max_step."""
+) -> tuple[List[Waypoint], List[int]]:
+    """Insert intermediate samples so consecutive waypoints stay within max_step.
+
+    Returns ``(dense, index_map)`` where ``index_map[i]`` is the index, inside
+    the returned dense list, of the i-th input waypoint. Callers that track
+    phase boundaries (which index into the original list) can remap them through
+    ``index_map`` to keep them aligned after resampling.
+    """
     if len(waypoints) < 2:
-        return list(waypoints)
+        return list(waypoints), list(range(len(waypoints)))
     out: List[Waypoint] = [waypoints[0]]
+    index_map: List[int] = [0]
     for a, b in zip(waypoints, waypoints[1:]):
         dx = b.x - a.x
         dy = b.y - a.y
@@ -121,7 +139,17 @@ def _densify_for_tracking(
             t = k / n
             theta = a.theta + _angle_diff(b.theta, a.theta) * t
             out.append(Waypoint(a.x + dx * t, a.y + dy * t, theta))
-    return out
+        index_map.append(len(out) - 1)
+    return out, index_map
+
+
+def _densify_for_tracking(
+    waypoints: List[Waypoint],
+    max_step: float = 0.15,
+) -> List[Waypoint]:
+    """Insert intermediate samples so consecutive waypoints stay within max_step."""
+    dense, _ = densify_waypoints(waypoints, max_step)
+    return dense
 
 
 def _goal_pose(lot: ParkingLot) -> tuple:
@@ -275,6 +303,19 @@ def _plan_perpendicular(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResult:
 # ---------------------------------------------------------------------------
 # MPC planner — kinematic simulation guided by MPC
 # ---------------------------------------------------------------------------
+def _collision_msg(mpc, x: float, y: float, theta: float, where: str) -> str:
+    """Pick a failure message: obstacle hit vs. lane/spot boundary.
+
+    The MPC planners do not avoid obstacles, so when one is present a collision
+    is most likely a body-obstacle overlap; say so explicitly (and point at the
+    obstacle-aware backends) rather than blaming the lane width.
+    """
+    if mpc.hits_obstacle(x, y, theta):
+        return ("Car body hit an obstacle — the MPC planners ignore obstacles; "
+                "use Hybrid A* or Q-learning for scenarios.")
+    return f"Car body exceeded valid area {where}."
+
+
 def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResult:
     from controller import CarDynamics, MPCController
 
@@ -287,7 +328,7 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
 
     x0, y0, th0 = lot.car_start_pose
     car = CarDynamics(x0, y0, th0, cc)
-    mpc = MPCController(lot, cc, ref.waypoints)
+    mpc = MPCController(lot, cc, ref.waypoints, obstacles=obstacles_for(lot))
 
     FORWARD_V = 3.0
     REVERSE_V = 1.5
@@ -311,7 +352,8 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
             print(f" failed ({time.perf_counter() - t0:.1f}s)")
             return _result_with_metrics(
                 pc, cc,
-                wps, False, "Car body exceeded valid area during forward drive.",
+                wps, False,
+                _collision_msg(mpc, car.x, car.y, car.theta, "during forward drive"),
                 phase_starts, phase_names, time.perf_counter() - t0, len(wps))
 
     # ── Phase 2+3: MPC reverse arc + straight into spot ────────────────────
@@ -335,7 +377,8 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
             return _result_with_metrics(
                 pc, cc,
                 wps, False,
-                "Car body exceeded valid area — try a wider lane or shorter car.",
+                _collision_msg(mpc, car.x, car.y, car.theta,
+                               "— try a wider lane or shorter car"),
                 phase_starts, phase_names, time.perf_counter() - t0, iterations)
 
         wps.append(Waypoint(car.x, car.y, car.theta))
@@ -418,7 +461,8 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
         return ref
 
     car = CarDynamics(*lot.car_start_pose, cc)
-    bounds_mpc = MPCController(lot, cc, [])   # used only for boundary checks
+    # used only for boundary + obstacle collision checks (no obstacle avoidance)
+    bounds_mpc = MPCController(lot, cc, [], obstacles=obstacles_for(lot))
 
     wps:          List[Waypoint] = [Waypoint(car.x, car.y, car.theta)]
     phase_starts: List[int]      = [0]
@@ -436,7 +480,9 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
             print(f" failed ({time.perf_counter() - t0:.1f}s)")
             return _result_with_metrics(
                 pc, cc,
-                wps, False, "Car body exceeded valid area during forward drive.",
+                wps, False,
+                _collision_msg(bounds_mpc, car.x, car.y, car.theta,
+                               "during forward drive"),
                 phase_starts, phase_names, time.perf_counter() - t0, len(wps))
 
     # ── Phase 2+: alternating REVERSING / FORWARD_CORRECT ─────────────────────
@@ -464,7 +510,8 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
                 return _result_with_metrics(
                     pc, cc,
                     wps, False,
-                    "Car body exceeded valid area — try a wider lane or shorter car.",
+                    _collision_msg(bounds_mpc, car.x, car.y, car.theta,
+                                   "— try a wider lane or shorter car"),
                     phase_starts, phase_names, time.perf_counter() - t0, iterations)
 
             wps.append(Waypoint(car.x, car.y, car.theta))
@@ -507,7 +554,9 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
                 print(f" failed ({time.perf_counter() - t0:.1f}s)")
                 return _result_with_metrics(
                     pc, cc,
-                    wps, False, "Car body exceeded valid area during correction.",
+                    wps, False,
+                    _collision_msg(bounds_mpc, car.x, car.y, car.theta,
+                                   "during correction"),
                     phase_starts, phase_names, time.perf_counter() - t0, iterations)
             if abs(car.theta) < math.radians(5):
                 break
@@ -536,7 +585,9 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
                 print(f" failed ({time.perf_counter() - t0:.1f}s)")
                 return _result_with_metrics(
                     pc, cc,
-                    wps, False, "Car body exceeded valid area during correction.",
+                    wps, False,
+                    _collision_msg(bounds_mpc, car.x, car.y, car.theta,
+                                   "during correction"),
                     phase_starts, phase_names, time.perf_counter() - t0, iterations)
             if car.x >= x_target - 0.05:
                 break

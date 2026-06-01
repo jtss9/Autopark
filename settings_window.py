@@ -213,6 +213,32 @@ class SettingsWindow:
                        selectcolor=COLOR_PANEL_2,
                        font=("Arial", 11)).pack(
             side="left", padx=4)
+        tk.Radiobutton(planner_frame, text="Hierarchical RL",
+                       variable=self.var_planner, value="hrl",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        planner_frame2 = tk.Frame(left, bg=COLOR_PANEL)
+        planner_frame2.grid(row=n * 2 + 6, column=0, sticky="w")
+        tk.Radiobutton(planner_frame2, text="DQN (RL)",
+                       variable=self.var_planner, value="dqn",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
+        tk.Radiobutton(planner_frame2, text="RRT*",
+                       variable=self.var_planner, value="rrt_star",
+                       bg=COLOR_PANEL, fg=COLOR_TEXT,
+                       activebackground=COLOR_PANEL,
+                       activeforeground=COLOR_TEXT,
+                       selectcolor=COLOR_PANEL_2,
+                       font=("Arial", 11)).pack(
+            side="left", padx=4)
 
         # ---- Right panel: expandable canvas ----
         right = tk.Frame(root, bg=COLOR_PANEL, padx=10, pady=8,

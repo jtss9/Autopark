@@ -17,6 +17,7 @@ from config import CarConfig, ParkingConfig
 from geom import (
     angle_diff as _angle_diff,
     path_length as _path_length,
+    rotated_rect_overlaps_aabb,
     wrap_pi as _wrap_pi,
 )
 from parking_lot import ParkingLot, Rect
@@ -127,9 +128,31 @@ class OccupancyGrid:
             in_spot = self._point_in_rect(cx, cy, spot, margin)
             if not (in_lane or in_spot):
                 return False
-            if self.point_is_blocked(cx, cy):
-                return False
+        if self._car_body_overlaps_blocked(pose):
+            return False
         return True
+
+    def _car_body_overlaps_blocked(self, pose: Pose) -> bool:
+        if not self.blocked:
+            return False
+        corners = self.lot.car_corners(pose)
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        ix0, iy0 = self.world_to_cell(min(xs), min(ys))
+        ix1, iy1 = self.world_to_cell(max(xs), max(ys))
+        res = self.resolution
+        for ix in range(max(0, ix0), min(self.width, ix1 + 1)):
+            for iy in range(max(0, iy0), min(self.height, iy1 + 1)):
+                if (ix, iy) not in self.blocked:
+                    continue
+                cell_left = self.min_x + ix * res
+                cell_bottom = self.min_y + iy * res
+                if rotated_rect_overlaps_aabb(
+                    corners, cell_left, cell_bottom,
+                    cell_left + res, cell_bottom + res,
+                ):
+                    return True
+        return False
 
 
 class HybridAStarPlanner:

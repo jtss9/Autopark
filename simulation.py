@@ -13,9 +13,27 @@ from config import CarConfig, ParkingConfig
 from hybrid_astar import OccupancyGrid
 from parking_lot import ParkingLot
 from scenarios import obstacles_for
-from trajectory import TrajectoryResult, plan_trajectory
+from trajectory import TrajectoryResult, densify_waypoints, plan_trajectory
 
 WIN_W, WIN_H = 1080, 720
+
+# Friendly display names for the planner backends (match the Settings UI).
+PLANNER_LABELS = {
+    "single": "Single-step MPC",
+    "multi": "Multi-step MPC",
+    "hybrid_astar": "Hybrid A*",
+    "qlearn": "Q-learning (RL)",
+    "hrl": "Hierarchical RL",
+    "dqn": "DQN (RL)",
+    "rrt_star": "RRT*",
+}
+
+# Resample the planned path to (at most) this spacing before animating. Hybrid
+# A* returns only ~20 coarse waypoints with segments up to several metres;
+# advancing a fixed number of waypoints per frame would teleport the car across
+# whole segments. A fine uniform spacing makes every planner animate at a
+# consistent ground speed.
+ANIM_MAX_STEP = 0.06
 
 # Colours
 C_BG         = (30,  30,  30)
@@ -69,6 +87,20 @@ class Simulation:
             planner=requested_planner,
             track=self.track_enabled,
         )
+        # Resample the planned path to a fine, uniform spacing so the animation
+        # advances at a consistent ground speed regardless of how coarse the
+        # planner's waypoints are. Mutates the display copy only — the reported
+        # metrics already captured the original planned waypoint count. Phase
+        # boundaries (which index into the original list) are remapped through
+        # index_map so the HUD phase label still switches at the right point.
+        if len(self.result.waypoints) >= 2:
+            dense, index_map = densify_waypoints(
+                self.result.waypoints, max_step=ANIM_MAX_STEP)
+            self.result.waypoints = dense
+            self.result.phase_starts = [
+                index_map[ps] if 0 <= ps < len(index_map) else ps
+                for ps in self.result.phase_starts
+            ]
         self.animation_speed = 1 if parking_config.parking_type == "parallel" else SPEED
 
         # UI toggles
@@ -86,13 +118,21 @@ class Simulation:
         )
 
     def _effective_planner_name(self, requested_planner: str) -> str:
-        if requested_planner == "hybrid_astar":
-            return "hybrid_astar"
-        if requested_planner == "qlearn":
-            return "qlearn (RL)"
-        if self.pc.parking_type == "parallel" or self.pc.obstacle_scenario != "none":
-            return "hybrid_astar"
-        return requested_planner
+        """HUD label for the planner that actually ran.
+
+        Mirrors the dispatch in trajectory.plan_trajectory. The MPC backends
+        run as requested even under an obstacle scenario (they detect, but do
+        not avoid, collisions), so the label is unchanged there. Parallel
+        parking is the one case still auto-promoted to Hybrid A* (the MPC
+        planners are perpendicular-only); surface that so the selection does
+        not look lost.
+        """
+        label = PLANNER_LABELS.get(requested_planner, requested_planner)
+        if requested_planner in ("hybrid_astar", "rrt_star", "qlearn", "hrl", "dqn"):
+            return label
+        if self.pc.parking_type == "parallel":
+            return f"Hybrid A* (auto from {label} — parallel)"
+        return label
 
     # ------------------------------------------------------------------
     # Coordinate transform

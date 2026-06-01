@@ -73,7 +73,7 @@ SCENARIO_CHOICES = (
     *SCENARIO_NAMES,
 )
 SWEEP_CHOICES = ("lane_width", "spot_size", "car_size", "none")
-PLANNER_CHOICES = ("baseline", "hybrid_astar", "qlearn", "all")
+PLANNER_CHOICES = ("baseline", "hybrid_astar", "rrt_star", "qlearn", "hrl", "dqn", "all")
 
 
 def _path_length(result: TrajectoryResult) -> float:
@@ -216,7 +216,7 @@ def _scenarios(selected: str) -> Sequence[str]:
 
 def _planners(selected: str) -> Sequence[str]:
     if selected == "all":
-        return ("baseline", "hybrid_astar", "qlearn")
+        return ("baseline", "hybrid_astar", "rrt_star", "qlearn", "hrl", "dqn")
     return (selected,)
 
 
@@ -282,6 +282,17 @@ def run_case(
         requested_planner = "multi" if pc.lane_width < 4.5 else "single"
     elif planner == "qlearn":
         requested_planner = "qlearn"
+    elif planner == "hrl":
+        requested_planner = "hrl"
+    elif planner == "dqn":
+        try:
+            from rl_dqn import require_torch
+            require_torch()
+        except RuntimeError as exc:
+            return _skip_row(pc, cc, planner, sweep, f"Skipped: {exc}")
+        requested_planner = "dqn"
+    elif planner == "rrt_star":
+        requested_planner = "rrt_star"
     else:
         requested_planner = "hybrid_astar"
 

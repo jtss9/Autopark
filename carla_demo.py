@@ -267,7 +267,7 @@ def run_carla(
         spectator = world.get_spectator().get_transform()
         spot_xy_world = (spectator.location.x, spectator.location.y)
         spot_yaw_deg = spectator.rotation.yaw
-        frame = LocalFrame(origin_xy=spot_xy_world, yaw_offset_deg=spot_yaw_deg)
+        frame = LocalFrame(origin_xy=spot_xy_world, yaw_offset_deg=-spot_yaw_deg)
 
         ego_local_x, ego_local_y = spot_offset_xy
         ego_world_x, ego_world_y = frame.local_to_world_xy(ego_local_x, ego_local_y)

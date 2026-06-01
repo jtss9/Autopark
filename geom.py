@@ -75,6 +75,37 @@ def path_length(waypoints: Sequence) -> float:
     )
 
 
+def rotated_rect_overlaps_aabb(
+    corners: Sequence[Tuple[float, float]],
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+) -> bool:
+    """SAT overlap test: rotated rectangle (4 corners) vs axis-aligned box.
+
+    Uses the Separating Axis Theorem with 4 candidate axes: the two AABB axes
+    plus the two unique edge normals of the rotated rectangle.
+    """
+    xs = [c[0] for c in corners]
+    ys = [c[1] for c in corners]
+    if max(xs) < left or min(xs) > right:
+        return False
+    if max(ys) < bottom or min(ys) > top:
+        return False
+
+    aabb_pts = ((left, bottom), (right, bottom), (right, top), (left, top))
+    for i in range(2):
+        x1, y1 = corners[i]
+        x2, y2 = corners[i + 1]
+        ax, ay = -(y2 - y1), x2 - x1
+        proj_r = [ax * px + ay * py for px, py in corners]
+        proj_a = [ax * px + ay * py for px, py in aabb_pts]
+        if max(proj_a) < min(proj_r) or max(proj_r) < min(proj_a):
+            return False
+    return True
+
+
 def closest_index(
     waypoints: Sequence,
     x: float,

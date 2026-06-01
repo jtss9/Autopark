@@ -13,6 +13,7 @@ import numpy as np
 from scipy.optimize import minimize
 
 from config import CarConfig
+from geom import rotated_rect_overlaps_aabb
 from geom import angle_diff as _angle_diff
 from parking_lot import ParkingLot
 
@@ -44,14 +45,21 @@ class MPCController:
     are handled externally.
     """
 
-    def __init__(self, lot: ParkingLot, cc: CarConfig, ref_waypoints):
+    def __init__(self, lot: ParkingLot, cc: CarConfig, ref_waypoints,
+                 obstacles=None):
         """
         ref_waypoints : list of objects with .x  .y  .theta attributes
+        obstacles     : optional list of Rect obstacles. The MPC cost is NOT
+                        aware of them (no avoidance) — they are used only by
+                        corners_in_bounds / hits_obstacle so a planner can
+                        detect (and fail on) a body-obstacle collision instead
+                        of silently driving through it.
         """
         self.lot = lot
         self.cc  = cc
         self.ref = ref_waypoints
         self.ref_idx = 0
+        self.obstacles = list(obstacles or [])
 
         self.N  = 5      # prediction horizon (steps)
         self.dt = 0.05   # seconds per MPC step
@@ -187,7 +195,7 @@ class MPCController:
 
     def corners_in_bounds(self, x: float, y: float, theta: float,
                           margin: float = 0.05) -> bool:
-        """True if every car corner is within lane ∪ spot (with margin)."""
+        """True if every car corner is within lane ∪ spot and clear of obstacles."""
         corners = self.lot.car_corners((x, y, theta))
         lane = self.lot.lane_rect
         spot = self.lot.spot_rect
@@ -199,4 +207,18 @@ class MPCController:
             if cy > lane.top + margin:
                 if cx < spot.x - margin or cx > spot.right + margin:
                     return False
+        if self.hits_obstacle(x, y, theta):
+            return False
         return True
+
+    def hits_obstacle(self, x: float, y: float, theta: float) -> bool:
+        """True if the car body overlaps any obstacle rectangle (SAT test)."""
+        if not self.obstacles:
+            return False
+        corners = self.lot.car_corners((x, y, theta))
+        for obs in self.obstacles:
+            if rotated_rect_overlaps_aabb(
+                corners, obs.x, obs.y, obs.right, obs.top,
+            ):
+                return True
+        return False

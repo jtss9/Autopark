@@ -128,6 +128,13 @@ def plot_path_length(rows, outpath: Path) -> None:
     plt.close(fig)
 
 
+_SWEEP_COLUMN = {
+    "lane_width": "lane_width",
+    "car_size": "car_length",
+    "spot_size": "spot_width",
+}
+
+
 def plot_sweep(
     rows: List[Dict[str, str]],
     sweep_key: str,
@@ -137,11 +144,12 @@ def plot_sweep(
 ) -> None:
     """Aggregate per (planner, x) value: mean line, individual points scattered."""
     import matplotlib.pyplot as plt
+    col = _SWEEP_COLUMN.get(sweep_key, sweep_key)
     series: Dict[str, Dict[float, List[float]]] = defaultdict(lambda: defaultdict(list))
     for r in rows:
         if r.get("sweep") != sweep_key:
             continue
-        x = _parse_float(r.get(sweep_key, ""))
+        x = _parse_float(r.get(col, ""))
         y = _parse_float(r.get(metric, ""))
         if x != x or y != y:
             continue
@@ -156,13 +164,12 @@ def plot_sweep(
         xs_sorted = sorted(xy.keys())
         means = [sum(xy[x]) / len(xy[x]) for x in xs_sorted]
         ax.plot(xs_sorted, means, marker="o", color=color, label=f"{planner} (mean)")
-        # Scatter individual samples lightly
         for x in xs_sorted:
             for y in xy[x]:
                 ax.scatter([x], [y], color=color, alpha=0.25, s=18)
-    ax.set_xlabel(sweep_key)
+    ax.set_xlabel(col)
     ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} vs {sweep_key}")
+    ax.set_title(f"{metric_label} vs {col}")
     ax.legend()
     fig.tight_layout()
     fig.savefig(outpath, dpi=140)

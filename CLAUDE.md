@@ -19,7 +19,7 @@ AUTOPARK_PLANNER=hybrid_astar python main.py   # force a planner, overriding the
 AUTOPARK_TRACK=1 python main.py                # run the Pure Pursuit tracker and overlay the executed path
 ```
 
-`AUTOPARK_PLANNER` accepts `single` | `multi` | `hybrid_astar` | `qlearn` (the legacy alias `baseline` maps to `single`). Leave it unset to honour the Settings-UI choice.
+`AUTOPARK_PLANNER` accepts `single` | `multi` | `hybrid_astar` | `rrt_star` | `qlearn` | `hrl` | `dqn` (the legacy alias `baseline` maps to `single`). Leave it unset to honour the Settings-UI choice.
 
 There is no lint step and no unit-test suite. Verify behaviour by running the app or the headless evaluator (below).
 
@@ -49,13 +49,16 @@ The interactive app runs in two sequential phases, looping back on the `S` keypr
 |---|---|
 | [config.py](config.py) | `CarConfig` and `ParkingConfig` dataclasses — the only data passed between phases |
 | [parking_lot.py](parking_lot.py) | `ParkingLot`: world geometry (`lane_rect`, `spot_rect`, `car_start_pose`, `car_corners`) |
-| [geom.py](geom.py) | Shared helpers: `angle_diff`, `wrap_pi`, `split_by_gear`, `path_length` (centralised to avoid per-module drift) |
+| [geom.py](geom.py) | Shared helpers: `angle_diff`, `wrap_pi`, `split_by_gear`, `path_length`, `rotated_rect_overlaps_aabb` (SAT collision test) |
 | [trajectory.py](trajectory.py) | `plan_trajectory()` dispatcher + the two MPC planners + tracker attachment + metrics |
 | [controller.py](controller.py) | `CarDynamics` (bicycle kinematic model) and `MPCController` (scipy SLSQP, horizon N=5, dt=0.05 s) |
 | [hybrid_astar.py](hybrid_astar.py) | `plan_hybrid_astar()`: state-lattice A* over (x, y, θ) with a Reeds-Shepp analytic shot |
 | [reeds_shepp.py](reeds_shepp.py) | Reeds-Shepp shortest paths: `shortest_path`, `discretize`, `path_length` (used as the A* heuristic + analytic shot) |
 | [tracker.py](tracker.py) | `track_path()`: Pure Pursuit closed-loop tracker over gear-split segments; `TrackerConfig`, `TrackResult` |
 | [rl_qlearn.py](rl_qlearn.py) | `plan_qlearn()`: tabular Q-learning parking baseline |
+| [rl_hierarchical.py](rl_hierarchical.py) | `plan_hierarchical_rl()`: hierarchical RL with rule-based primitives + Q-learning fallback |
+| [rl_dqn.py](rl_dqn.py) | `plan_dqn()`: Deep Q-Network planner (requires PyTorch) |
+| [rrt_star.py](rrt_star.py) | `plan_rrt_star()`: RRT* sampling-based planner with bicycle-kinematic steering |
 | [scenarios.py](scenarios.py) | `obstacles_for(lot)` → list of `Rect` obstacles for the selected obstacle scenario |
 | [simulation.py](simulation.py) | pygame render loop, HUD, occupancy-grid overlay, executed-path overlay, keyboard handling |
 | [settings_window.py](settings_window.py) | tkinter sliders/radios + live preview canvas |
@@ -74,20 +77,27 @@ All world geometry uses **+x right, +y up** (metres), θ in radians. Both tkinte
 | Condition | Backend |
 |---|---|
 | `effective == "qlearn"` | `rl_qlearn.plan_qlearn` |
+| `effective == "hrl"` | `rl_hierarchical.plan_hierarchical_rl` |
+| `effective == "dqn"` | `rl_dqn.plan_dqn` |
+| `effective == "rrt_star"` | `rrt_star.plan_rrt_star` |
 | `effective == "hybrid_astar"` | `hybrid_astar.plan_hybrid_astar` |
-| `pc.obstacle_scenario != "none"` | `plan_hybrid_astar` (auto-promoted — the MPC planners have no obstacle awareness) |
 | perpendicular + `effective == "multi"` | `_plan_perpendicular_multistep` |
 | perpendicular (otherwise) | `_plan_perpendicular_mpc` (single-step) |
-| parallel | `plan_hybrid_astar` |
+| parallel | `plan_hybrid_astar` (auto-promoted — the MPC planners are perpendicular-only) |
+
+The MPC planners run as requested **even under an obstacle scenario** — the planner choice is honoured rather than silently swapped. Their cost function has no obstacle term (no avoidance), but they now *detect* a body-obstacle overlap via `MPCController.hits_obstacle` and fail with a clear message, so they demonstrate the limitation instead of driving through an obstacle and reporting success. Obstacle-aware planning still requires Hybrid A*, Q-learning, or Hierarchical RL. Both the A* occupancy-grid check and the MPC `hits_obstacle` now use SAT (Separating Axis Theorem) via `geom.rotated_rect_overlaps_aabb`, which catches edge-only intersections and small obstacles entirely under the car body — not just corner-point tests.
 
 When `track=True` and the plan is feasible, `_attach_tracker` densifies the path and runs `tracker.track_path`, populating `result.executed_waypoints` and `result.tracking_metrics` (mean/max CTE, final pose error, fully-in-spot, cusps).
 
 ### Planners
 
-- **Single-step MPC** (`_plan_perpendicular_mpc`): builds a geometric 3-phase arc reference (forward → reverse arc → straight into spot) and tracks it with `MPCController`. Reactive boundary penalty keeps it in bounds; fails (collision) in narrow lanes.
+- **Single-step MPC** (`_plan_perpendicular_mpc`): builds a geometric 3-phase arc reference (forward → reverse arc → straight into spot) and tracks it with `MPCController`. Reactive boundary penalty keeps it in bounds; fails (collision) in narrow lanes. No obstacle avoidance — under a scenario it runs anyway and fails on the first body-obstacle overlap.
 - **Multi-step MPC** (`_plan_perpendicular_multistep`): a narrow-lane specialist. Each attempt builds a fresh arc reference from the car's current pose, reverses to the goal depth (`spot_top − 0.15`), and on a road-bottom WARN runs a two-phase correction (reverse hard-right until |θ|≈0, then drive forward to a safe x), repeating up to 5 times. Uses a **rigid** arc, so for a large car in ~5 m lanes it can clip the spot edge where single-step's reactive MPC succeeds.
 - **Hybrid A\*** (`plan_hybrid_astar`): state-lattice A* over discretised (x, y, θ) with forward/reverse × 5 steering primitives, a Reeds-Shepp analytic shot (attempted every `rs_shot_interval=50` expansions and unconditionally within `rs_shot_radius=4.5` m), an RS-length heuristic cache, and final path smoothing. Handles obstacles and parallel parking. Key tunables live on `HybridAStarPlanner.__init__` (`xy_resolution=0.10`, `theta_bins=36`, `motion_step=0.45`, `goal_xy_tolerance=0.35`, `max_iterations=150000`).
 - **Q-learning** (`plan_qlearn`): tabular RL baseline, kept for comparison in the evaluator.
+- **Hierarchical RL** (`plan_hierarchical_rl`): combines rule-based parking primitives (drive-to-setup, reverse-toward-spot, enter-spot, correct-forward) with tabular Q-learning fallback. The rollout uses a rule-based phase detector for primary action selection and falls back to the Q-table when stuck. Succeeds where flat Q-learning fails by encoding parking-domain knowledge in the primitives.
+- **DQN** (`plan_dqn`): Deep Q-Network — same action set as flat Q-learning but replaces the table with a 2-layer MLP (128-128) over 7 goal-relative state features. Uses experience replay and a target network. Requires PyTorch; the evaluator skips gracefully if torch is not installed.
+- **RRT\*** (`plan_rrt_star`): sampling-based planner. Builds a tree of kinematically feasible trajectories via random sampling, nearest-neighbour steering with bicycle kinematics, and rewiring for path optimality. Probabilistically complete but non-deterministic. Handles obstacles and parallel parking.
 
 `MPCController.optimize()` uses scipy `minimize(method='SLSQP')` with a cost over position error, heading error, steering effort, steering rate, and boundary violation (`w_boundary`). Speed `v` is supplied by the caller, so gear changes are owned by the planner, not the controller.
 
@@ -106,7 +116,7 @@ MPC horizon N    = 5,  dt = 0.05 s
 
 ### Obstacle scenarios
 
-`ParkingConfig.obstacle_scenario` ∈ `none` · `entry_blocker` · `tight_lane` · `pillar_near_entry` · `parked_cars`. `scenarios.obstacles_for(lot)` returns the corresponding `Rect` obstacles (empty for `none`/`tight_lane`). Any non-`none` scenario forces the Hybrid A* backend.
+`ParkingConfig.obstacle_scenario` ∈ `none` · `entry_blocker` · `tight_lane` · `pillar_near_entry` · `parked_cars`. `scenarios.obstacles_for(lot)` returns the corresponding `Rect` obstacles (empty for `none`/`tight_lane`). A scenario does **not** override the planner choice: Hybrid A* and Q-learning plan around the obstacles, while the MPC planners run without avoidance and fail on first contact (see the dispatch note above).
 
 ### CARLA stretch goal
 

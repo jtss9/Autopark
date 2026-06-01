@@ -397,6 +397,12 @@ class RRTStarPlanner:
         return True
 
     def _smooth_path(self, waypoints: List[Waypoint]) -> List[Waypoint]:
+        """Remove redundant waypoints while preserving kinematic feasibility.
+
+        A shortcut a→c is only taken when the heading change along the
+        path segment AND the car-heading jump are both small, so the
+        smoothed path never demands an instantaneous nonholonomic turn.
+        """
         if len(waypoints) <= 2:
             return list(waypoints)
         cleaned = [waypoints[0]]
@@ -409,10 +415,18 @@ class RRTStarPlanner:
 
         smoothed = [cleaned[0]]
         for i in range(1, len(cleaned) - 1):
-            a, c = smoothed[-1], cleaned[i + 1]
-            if self._segment_valid(a, c):
+            a = smoothed[-1]
+            b = cleaned[i]
+            c = cleaned[i + 1]
+            ab = math.atan2(b.y - a.y, b.x - a.x)
+            bc = math.atan2(c.y - b.y, c.x - b.x)
+            heading_change = abs(_angle_diff(ab, bc))
+            car_heading_change = abs(_angle_diff(c.theta, a.theta))
+            if (heading_change < math.radians(7)
+                    and car_heading_change < math.radians(10)
+                    and self._segment_valid(a, c)):
                 continue
-            smoothed.append(cleaned[i])
+            smoothed.append(b)
         smoothed.append(cleaned[-1])
         return smoothed
 

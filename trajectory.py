@@ -61,8 +61,14 @@ def plan_trajectory(
         from rl_hierarchical import plan_hierarchical_rl
         result = plan_hierarchical_rl(pc, cc)
     elif effective == "dqn":
-        from rl_dqn import plan_dqn
-        result = plan_dqn(pc, cc)
+        from rl_dqn import TORCH_AVAILABLE
+        if not TORCH_AVAILABLE:
+            result = TrajectoryResult(
+                [], False,
+                "DQN requires PyTorch. Install with `pip install torch`.")
+        else:
+            from rl_dqn import plan_dqn
+            result = plan_dqn(pc, cc)
     elif effective == "rrt_star":
         from rrt_star import plan_rrt_star
         result = plan_rrt_star(pc, cc)

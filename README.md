@@ -2,16 +2,21 @@
 
 A top-down 2D parking simulation built for the *Introduction to Smart Cars*
 course final project. Configure road and vehicle dimensions, pick a parking
-mode (perpendicular / parallel), a scenario (clear / entry-blocker / pillar /
-parked-cars / tight-lane) and a planner (geometric MPC baseline / Hybrid A* with
+mode (perpendicular / parallel) and a planner (geometric MPC / Hybrid A* with
 Reeds-Shepp analytic shot / tabular Q-learning), then watch the car execute
-the maneuver. Optionally turn on the Pure Pursuit closed-loop tracker to see
-the executed (control-tracked) trajectory laid against the planned one.
+the maneuver. With Hybrid A* you can drop a draggable obstacle in the preview
+and the planner routes around it. Optionally turn on the Pure Pursuit
+closed-loop tracker to see the executed (control-tracked) trajectory laid
+against the planned one.
 
-The project is framed as a map-based autonomous parking stack; see
-`PROJECT_SCOPE.md` for the full target architecture. For day-to-day operation,
-see `USER_GUIDE.md`. Major in-progress work and design decisions are recorded
-in `UPDATE.md`.
+---
+
+## Project layout
+
+`main.py` is the only Python file in the repository root; all other source
+modules live in `src/`. `main.py` adds `src/` to the import path at startup, so
+the modules keep flat imports. Run the app from the root with `python main.py`;
+run the helper scripts as `python src/<script>.py`.
 
 ---
 
@@ -55,10 +60,10 @@ AUTOPARK_TRACK=1 AUTOPARK_PLANNER=hybrid_astar python main.py
 To run batch evaluation metrics:
 
 ```bash
-python evaluate.py                                  # default sweep
-python evaluate.py --mode all --scenario all --planner all --output results/all.csv
-python evaluate.py --planner hybrid_astar --track --output results/tracked.csv
-python plot_results.py results/all.csv              # writes PNGs to results/figures/
+python src/evaluate.py                                  # default sweep
+python src/evaluate.py --mode all --scenario all --planner all --output results/all.csv
+python src/evaluate.py --planner hybrid_astar --track --output results/tracked.csv
+python src/plot_results.py results/all.csv              # writes PNGs to results/figures/
 ```
 
 ---
@@ -67,7 +72,9 @@ python plot_results.py results/all.csv              # writes PNGs to results/fig
 
 ### Phase 1 — Settings Window
 
-Adjust all parameters using the sliders on the left. The preview canvas on the right updates in real time.
+Adjust all parameters using the sliders on the left. The preview canvas on the
+right updates in real time and annotates all five dimensions (lane width, spot
+length/width, car length/width).
 
 | Slider | Range |
 |---|---|
@@ -78,22 +85,27 @@ Adjust all parameters using the sliders on the left. The preview canvas on the r
 | Car Width | 1.6 – 2.2 m |
 
 **Parking Type**
-- **Reverse into Spot (倒車入庫)** — car starts parallel to the road and reverses perpendicularly into the spot
-- **Parallel Parking (路邊停車)** — planned with Hybrid A*
-
-**Scenario**
-- **Clear** — empty parking environment
-- **Entry Blocker** — adds one occupied region near the parking entry
-- **Tight Lane** — used by the evaluator as a narrow-lane scenario
-- **Parked Cars** — adds parked-car obstacle rectangles around the target
+- **Reverse into Spot (倒車入庫)** — car starts parallel to the road and reverses perpendicularly into the spot (single-step MPC)
+- **Parallel Parking (路邊停車)** — two-arc S-curve tracked by MPC into the curb-side spot
 
 **Planner**
 - **Single-step MPC** — tracks a pre-computed geometric arc; succeeds in wider lanes, fails with COLLISION in narrow ones
-- **Multi-step MPC** — uses alternating reverse/correction attempts; extends the feasibility boundary into narrower lanes where single-step fails
 - **Hybrid A*** — map-based planner with Reeds-Shepp analytic shot for perpendicular, parallel, and obstacle-aware scenarios
 - **Q-learning (RL)** — tabular Q-learning agent with reverse-curriculum training over a discretized (x, y, θ) grid; included as a learned-policy comparison baseline
 
-If the car is too large for the spot, the spot outline turns red and simulation is blocked until dimensions are corrected.
+(The Multi-step MPC planner still exists in the code and is reachable via
+`AUTOPARK_PLANNER=multi` / the evaluator, but is hidden in the UI because it
+does not generalise cleanly across vehicle/spot sizes.)
+
+**Obstacle (Hybrid A* only)**
+When the planner is Hybrid A*, an **Add obstacle** checkbox appears. Tick it to
+place a fixed-size (0.9 m) obstacle in the preview, then drag it into position.
+The obstacle cannot be dropped on the car (start) or inside the spot (goal).
+The same obstacle is drawn in the simulation and the Hybrid A* planner routes
+around it.
+
+If the car is too large for the spot, the spot outline turns red and simulation
+is blocked until dimensions are corrected.
 
 Click **Start Simulation** to proceed.
 
@@ -104,15 +116,15 @@ Animates the full parking trajectory computed by the selected planner.
 | Key | Action |
 |---|---|
 | `SPACE` | Pause / resume |
+| `↑` / `↓` | Animation speed |
 | `R` | Restart animation |
 | `G` | Toggle occupancy-grid overlay |
 | `T` | Toggle executed (closed-loop) path overlay |
 | `S` | Return to settings (preserves last slider values) |
 | `ESC` / `Q` | Quit |
 
-The HUD shows parking type, active planner, scenario, dimensions, status,
-current phase name, step counter, final containment, and planner metrics when
-available.
+The HUD shows parking type, active planner, dimensions, status, current phase
+name, step counter, final containment, and planner metrics when available.
 
 **Feasibility**: if the car body would clip a boundary or the final pose is not
 fully inside the spot, the animation plays to the last available waypoint, the
@@ -124,27 +136,26 @@ car turns red, and a **FAILED** overlay plus concrete failure message is shown.
 
 ```
 final/
-├── main.py              # Entry point: settings → simulation loop
-├── config.py            # CarConfig and ParkingConfig dataclasses
-├── parking_lot.py       # World-space geometry (lane, spot, car corners)
-├── scenarios.py         # Static obstacle scenarios
-├── settings_window.py   # Phase 1: tkinter settings UI with live preview
-├── trajectory.py        # Trajectory planner dispatch + result/tracker glue
-├── hybrid_astar.py      # Hybrid A* planner over (x, y, θ) with Reeds-Shepp shot
-├── reeds_shepp.py       # Reeds-Shepp shortest-path generator (CSC + CCC, full RS via symmetries)
-├── tracker.py           # Pure Pursuit closed-loop tracker with gear-aware cusps
-├── rl_qlearn.py         # Tabular Q-learning planner with reverse curriculum
-├── controller.py        # Bicycle kinematic model and MPC controller
-├── simulation.py        # Phase 2: pygame animation loop
-├── evaluate.py          # Batch CSV evaluation runner with --track and --planner all
-├── plot_results.py      # Render report figures from evaluator CSV
-├── carla_bridge.py      # CARLA stretch: lazy import + connection + obstacle/pose helpers
-├── carla_controller.py  # CARLA stretch: Pure Pursuit → carla.VehicleControl adapter
-├── carla_demo.py        # CARLA stretch: end-to-end demo (--carla or --dry-run)
-├── PROJECT_SCOPE.md     # Upgraded final-project scope and implementation plan
-├── USER_GUIDE.md        # How to run and interact with the simulator
-├── UPDATE.md            # Running log of major implementation updates
-└── requirements.txt
+├── main.py              # Entry point (only root .py): settings → simulation loop, bootstraps src/ on sys.path
+├── requirements.txt
+├── README.md · CLAUDE.md · SUMMARY.md
+└── src/
+    ├── config.py            # CarConfig and ParkingConfig dataclasses (incl. obstacle field)
+    ├── parking_lot.py       # World-space geometry (lane, spot, car corners), Rect
+    ├── scenarios.py         # Named obstacle scenarios (evaluator)
+    ├── settings_window.py   # Phase 1: tkinter settings UI, live preview, draggable obstacle
+    ├── trajectory.py        # Planner dispatch + MPC planners (perp/parallel) + early-stop + tracker glue
+    ├── hybrid_astar.py      # Hybrid A* over (x, y, θ) with Reeds-Shepp shot; OccupancyGrid + SAT collision
+    ├── reeds_shepp.py       # Reeds-Shepp shortest-path generator (CSC + CCC, full RS via symmetries)
+    ├── tracker.py           # Pure Pursuit closed-loop tracker with gear-aware cusps
+    ├── rl_qlearn.py         # Tabular Q-learning planner with reverse curriculum
+    ├── controller.py        # Bicycle kinematic model and MPC controller
+    ├── simulation.py        # Phase 2: pygame animation loop
+    ├── evaluate.py          # Batch CSV evaluation runner with --track and --planner all
+    ├── plot_results.py      # Render report figures from evaluator CSV
+    ├── carla_bridge.py      # CARLA stretch: lazy import + connection + obstacle/pose helpers
+    ├── carla_controller.py  # CARLA stretch: Pure Pursuit → carla.VehicleControl adapter
+    └── carla_demo.py        # CARLA stretch: end-to-end demo (--carla or --dry-run)
 ```
 
 ---
@@ -160,38 +171,52 @@ The reference point for all waypoints and car corner calculations is the **rear 
 
 ## Trajectory Planning
 
-### Single-step MPC (default planner)
+### Geometric reference + MPC tracking
 
-Uses a two-stage pipeline:
+The default planner for both parking types is a single two-stage pipeline; only
+the **geometry strategy** in stage 1 differs between perpendicular and parallel.
 
-1. **Geometric reference** — a 3-phase arc path (drive forward → reverse arc → straight into spot) computed analytically from the minimum turning radius.
-2. **MPC simulation** — a kinematic bicycle model is stepped forward under a receding-horizon MPC (horizon N=5, dt=0.05 s) that tracks the reference while penalising boundary violations. All four car body corners are checked at every step; any violation terminates planning and returns the collision waypoints for animation.
+1. **Geometric reference** — an analytic reference path computed from the
+   minimum turning radius. The shape depends on the parking type (below).
+2. **MPC simulation** — a kinematic bicycle model is stepped forward under a
+   receding-horizon MPC (horizon N=5, dt=0.05 s) that tracks the reference while
+   penalising boundary violations. All four car body corners are checked at
+   every step; any violation terminates planning and returns the collision
+   waypoints for animation.
+3. **Termination — early-stop ("park then align")** — instead of driving the
+   full reference path (which would keep reversing and clip the spot's far edge),
+   the loop stops the moment the whole car body is inside the spot **and** the
+   heading is within `ALIGN_TOL = 8°` of the goal. It remembers the most-aligned
+   in-spot pose; if a later step would leave bounds, it truncates back to that
+   pose and reports success instead of a collision.
 
-### Multi-step MPC
+The geometry strategy in stage 1 is the only part that differs by parking type:
 
-Extends feasibility into narrow lanes where single-step fails. Algorithm:
+**Perpendicular — single-step (倒車入庫, `_plan_perpendicular` + `_plan_perpendicular_mpc`)**
+A 3-phase arc: drive forward → 90° reverse arc → straight reverse into the spot.
+Succeeds in wider lanes; fails with COLLISION in narrow ones.
 
-1. **Drive forward** to the initial arc start position.
-2. **Reverse (attempt N)** — fresh arc reference rebuilt from the car's current heading; MPC tracks it toward the spot.
-3. **Correct** if any corner approaches the road edge: Phase A reverses with full right steer to regain y-clearance; Phase B drives forward to a safe x-position.
-4. Repeat 2–3 up to 5 times; declare success when the rear axle reaches the spot centre.
+**Perpendicular — multi-step (`_plan_perpendicular_multistep`) — ⚠ future work**
+Aims to extend feasibility into narrow lanes by running alternating reverse /
+forward-correction attempts (up to 5), rebuilding a fresh arc each time. Does
+**not** generalise reliably across vehicle/spot sizes yet, so it is **hidden
+from the Settings UI** and left as future work; still reachable via
+`AUTOPARK_PLANNER=multi` and the evaluator for experimentation.
 
-**Demo case** (feasibility improvement):
-Set Car Length = 3.8 m, Car Width = 1.6 m, Lane Width = 4.2 m.  
-Single-step → COLLISION. Multi-step → 2-attempt success.
-
-```
-wheelbase       = car_length × 0.65
-max_steer_angle = 35°
-R_min           = wheelbase / tan(max_steer_angle)  ≈ 3–5 m
-```
+**Parallel — single-step (路邊停車, `_plan_parallel` + `_plan_parallel_mpc`)**
+An equal-radius **two-arc S-curve**: drive forward to `x_stop`, reverse with
+right steer through `α = arccos(1 − Δy/2R)` (where `Δy = lane_width/2 + spot_width/2`),
+then reverse with left steer back to heading 0 inside the curb-side spot.
 
 ### Hybrid A* with Reeds-Shepp analytic shot
 
-The Hybrid A* planner (`hybrid_astar.py`) searches over `(x, y, θ)` using
+The Hybrid A* planner (`src/hybrid_astar.py`) searches over `(x, y, θ)` using
 forward/reverse bicycle-model motion primitives and validates every candidate
-pose with full car-corner collision checking against the lane, spot, and
-obstacle rectangles. Three upgrades over a plain Hybrid A*:
+pose against the lane, spot, and obstacle rectangles. Collision checking uses
+the car-corner containment test **plus an exact Separating-Axis-Theorem (SAT)**
+car-body-vs-obstacle intersection, so a small obstacle sitting under the middle
+of a car edge (no corner touching it) is still caught. Three upgrades over a
+plain Hybrid A*:
 
 - **Reeds-Shepp analytic shot.** At every popped node within a configurable
   radius (and periodically when farther away), the planner tries a closed-form
@@ -207,20 +232,24 @@ obstacle rectangles. Three upgrades over a plain Hybrid A*:
   removed while preserving the first and final pose and rejecting any cleanup
   segment that collides or leaves valid bounds.
 
+Obstacles come from two sources: the interactive draggable obstacle
+(`ParkingConfig.obstacle`) and the named scenarios used by the evaluator
+(`scenarios.obstacles_for`). Both are merged in `plan_hybrid_astar`.
+
 ### Pure Pursuit closed-loop tracker
 
-`tracker.py` splits the planned path into single-gear segments (cusps detected
-by the sign of the heading-projected motion) and runs a standard Pure Pursuit
-controller on each segment under the same kinematic bicycle model. The reverse
-segments flip both the lookahead frame and the steering sign — without that
-sign flip the agent drives away from the path because
+`src/tracker.py` splits the planned path into single-gear segments (cusps
+detected by the sign of the heading-projected motion) and runs a standard Pure
+Pursuit controller on each segment under the same kinematic bicycle model. The
+reverse segments flip both the lookahead frame and the steering sign — without
+that sign flip the agent drives away from the path because
 `θ̇ = v·tan(δ)/L` inverts with `v`. Output metrics include cusp count, mean
 and max cross-track error, executed-final position/heading error, and whether
 the executed (control-tracked) pose ends fully inside the spot.
 
 ### Tabular Q-learning RL planner
 
-`rl_qlearn.py` discretizes the rear-axle state into `(ix, iy, ith)` buckets,
+`src/rl_qlearn.py` discretizes the rear-axle state into `(ix, iy, ith)` buckets,
 exposes 10 discrete `(gear × steering)` actions, and trains a tabular Q
 function with ε-greedy exploration, potential-based shaping on distance and
 heading, and a large terminal bonus when the car is fully inside the spot.
@@ -243,23 +272,23 @@ applicable), `waypoints`, `final_pos_error_m`, `final_heading_error_deg`,
 enabled the result also carries `mean_cte_m`, `max_cte_m`, `cusps`,
 `exec_final_pos_error_m`, `exec_fully_in_spot`.
 
-`evaluate.py` writes a stable CSV with every column above and is the
+`src/evaluate.py` writes a stable CSV with every column above and is the
 report-facing CLI:
 
 ```bash
-python evaluate.py
-python evaluate.py --mode parallel --scenario all --planner hybrid_astar
-python evaluate.py --mode all --scenario all --planner all --output results/all.csv
-python evaluate.py --mode all --scenario all --sweep lane_width --planner all --output results/lane_width.csv
-python evaluate.py --planner hybrid_astar --track --output results/tracked.csv
-python plot_results.py results/all.csv
+python src/evaluate.py
+python src/evaluate.py --mode parallel --scenario all --planner hybrid_astar
+python src/evaluate.py --mode all --scenario all --planner all --output results/all.csv
+python src/evaluate.py --mode all --scenario all --sweep lane_width --planner all --output results/lane_width.csv
+python src/evaluate.py --planner hybrid_astar --track --output results/tracked.csv
+python src/plot_results.py results/all.csv
 ```
 
 ### CARLA stretch goal
 
-`carla_bridge.py`, `carla_controller.py`, and `carla_demo.py` wire the same
-Hybrid A* + Reeds-Shepp planner and Pure Pursuit controller into a live CARLA
-server. The architecture is:
+`src/carla_bridge.py`, `src/carla_controller.py`, and `src/carla_demo.py` wire
+the same Hybrid A* + Reeds-Shepp planner and Pure Pursuit controller into a live
+CARLA server. The architecture is:
 
 - `carla_bridge.py` lazy-imports `carla`, owns the client/world lifecycle, and
   converts CARLA world coordinates to our planner frame. It exposes helpers
@@ -284,12 +313,12 @@ pip install carla        # version must match your CARLA server
 Run end-to-end against a live server:
 
 ```bash
-python carla_demo.py --carla --host localhost --port 2000 --mode perpendicular
+python src/carla_demo.py --carla --host localhost --port 2000 --mode perpendicular
 ```
 
 Or run the dry-run pipeline (no CARLA needed):
 
 ```bash
-python carla_demo.py --dry-run --mode parallel
-python carla_demo.py --dry-run --mode perpendicular --scenario parked_cars
+python src/carla_demo.py --dry-run --mode parallel
+python src/carla_demo.py --dry-run --mode perpendicular --scenario parked_cars
 ```

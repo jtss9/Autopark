@@ -11,7 +11,7 @@ import pygame
 
 from config import CarConfig, ParkingConfig
 from hybrid_astar import OccupancyGrid
-from parking_lot import ParkingLot
+from parking_lot import ParkingLot, Rect
 from scenarios import obstacles_for
 from trajectory import TrajectoryResult, plan_trajectory
 
@@ -82,17 +82,21 @@ class Simulation:
         # Build a lightweight occupancy grid for visualization regardless of
         # planner. Cache the obstacle list so per-frame drawing does not
         # re-run scenario dispatch + list allocation 60 times per second.
+        # User-placed obstacle from the settings window: (x, y, w, h) or None.
+        # The planner already accounts for it (via pc.obstacle in plan_hybrid_astar);
+        # here we include it in the visualization grid so the G overlay matches.
+        self._user_obstacle = self.pc.obstacle
+
         self._obstacles = obstacles_for(self.lot)
+        viz_obstacles = list(self._obstacles)
+        if self._user_obstacle is not None:
+            x, y, w, h = self._user_obstacle
+            viz_obstacles.append(Rect(x, y, w, h))
         self._viz_grid = OccupancyGrid(
             self.lot,
             resolution=0.5,
-            obstacles=self._obstacles,
+            obstacles=viz_obstacles,
         )
-
-        # User-placed obstacle from the settings window: (x, y, w, h) or None.
-        # Drawn for reference only — NOT fed into the planner or the occupancy
-        # grid yet, so the calculation is unchanged.
-        self._user_obstacle = self.pc.obstacle
 
     def _effective_planner_name(self, requested_planner: str) -> str:
         if requested_planner == "hybrid_astar":

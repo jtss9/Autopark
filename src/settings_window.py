@@ -283,6 +283,17 @@ class SettingsWindow:
         ax0, ay0, ax1, ay1 = self._car_aabb(lot)
         return (ax0 - hw < cx < ax1 + hw) and (ay0 - hh < cy < ay1 + hh)
 
+    def _obstacle_overlaps_spot(self, cx, cy, lot: ParkingLot) -> bool:
+        """Obstacle on the spot would invalidate the goal pose — forbid it."""
+        hw, hh = self.OBS_W / 2, self.OBS_H / 2
+        spot = lot.spot_rect
+        return (spot.x - hw < cx < spot.right + hw) and \
+               (spot.y - hh < cy < spot.top + hh)
+
+    def _obstacle_blocked(self, cx, cy, lot: ParkingLot) -> bool:
+        return (self._obstacle_overlaps_car(cx, cy, lot)
+                or self._obstacle_overlaps_spot(cx, cy, lot))
+
     def _default_obs_center(self, lot: ParkingLot):
         """A starting spot for the obstacle: right of the parking bay, clear
         of the car. Nudged right until it no longer overlaps the car."""
@@ -291,7 +302,7 @@ class SettingsWindow:
         cy = lane.y + lane.h / 2
         cx, cy = self._clamp_to_bounds(cx, cy, lot)
         tries = 0
-        while self._obstacle_overlaps_car(cx, cy, lot) and tries < 60:
+        while self._obstacle_blocked(cx, cy, lot) and tries < 120:
             cx, cy = self._clamp_to_bounds(cx + 0.2, cy, lot)
             tries += 1
         return cx, cy
@@ -320,8 +331,9 @@ class SettingsWindow:
         wx, wy = self._c2w(ev.x, ev.y)
         cx, cy = self._clamp_to_bounds(wx + self._grab_dx,
                                        wy + self._grab_dy, lot)
-        # Reject positions overlapping the car — the obstacle can't sit on it.
-        if not self._obstacle_overlaps_car(cx, cy, lot):
+        # Reject positions on the car (start) or the spot (goal) — both would
+        # make planning impossible.
+        if not self._obstacle_blocked(cx, cy, lot):
             self._obs_center = (cx, cy)
             self._update_preview()
 
@@ -407,7 +419,7 @@ class SettingsWindow:
                 self._obs_center = self._default_obs_center(lot)
             else:
                 cx, cy = self._clamp_to_bounds(*self._obs_center, lot)
-                if self._obstacle_overlaps_car(cx, cy, lot):
+                if self._obstacle_blocked(cx, cy, lot):
                     cx, cy = self._default_obs_center(lot)
                 self._obs_center = (cx, cy)
             cx, cy = self._obs_center

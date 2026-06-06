@@ -24,6 +24,44 @@ from trajectory import TrajectoryResult, Waypoint
 Pose = Tuple[float, float, float]
 
 
+def _unit(dx: float, dy: float) -> Tuple[float, float]:
+    n = math.hypot(dx, dy)
+    if n < 1e-9:
+        return (1.0, 0.0)
+    return (dx / n, dy / n)
+
+
+def _separated_on_axis(poly_a, poly_b, axis) -> bool:
+    """True if the two convex polygons' projections onto `axis` do not overlap."""
+    ax, ay = axis
+    a_proj = [px * ax + py * ay for px, py in poly_a]
+    b_proj = [px * ax + py * ay for px, py in poly_b]
+    return max(a_proj) < min(b_proj) or max(b_proj) < min(a_proj)
+
+
+def _obb_hits_rect(car_corners, rect: "Rect", margin: float = 0.0) -> bool:
+    """Exact overlap test between the oriented car footprint (4 corners) and an
+    axis-aligned obstacle Rect, via the Separating Axis Theorem.
+
+    Only four candidate axes are needed: world x, world y, and the car's two
+    edge directions. If any axis separates the two polygons, they don't touch.
+    """
+    rx0, ry0 = rect.x - margin, rect.y - margin
+    rx1, ry1 = rect.right + margin, rect.top + margin
+    rect_pts = [(rx0, ry0), (rx1, ry0), (rx1, ry1), (rx0, ry1)]
+    (ax, ay), (bx, by), _c, (dx, dy) = car_corners  # rear-left, front-left, _, rear-right
+    axes = [
+        (1.0, 0.0),
+        (0.0, 1.0),
+        _unit(bx - ax, by - ay),
+        _unit(dx - ax, dy - ay),
+    ]
+    for axis in axes:
+        if _separated_on_axis(car_corners, rect_pts, axis):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class GridIndex:
     ix: int
@@ -60,6 +98,7 @@ class OccupancyGrid:
         self.lot = lot
         self.resolution = resolution
         self.obstacles = list(obstacles or [])
+        self.obstacle_margin = 0.05   # safety clearance for the SAT body check
 
         min_x = min(lot.lane_rect.x, lot.spot_rect.x)
         min_y = min(lot.lane_rect.y, lot.spot_rect.y)
@@ -118,12 +157,18 @@ class OccupancyGrid:
 
         lane = self.lot.lane_rect
         spot = self.lot.spot_rect
-        for cx, cy in self.lot.car_corners((x, y, theta)):
+        corners = self.lot.car_corners((x, y, theta))
+        for cx, cy in corners:
             in_lane = self._point_in_rect(cx, cy, lane, margin)
             in_spot = self._point_in_rect(cx, cy, spot, margin)
             if not (in_lane or in_spot):
                 return False
             if self.point_is_blocked(cx, cy):
+                return False
+        # Exact car-body vs obstacle test (SAT) — catches small obstacles that
+        # sit under a car edge with no corner landing in a blocked cell.
+        for obs in self.obstacles:
+            if _obb_hits_rect(corners, obs, self.obstacle_margin):
                 return False
         return True
 
@@ -518,13 +563,22 @@ def parallel_goal_pose(lot: ParkingLot) -> Pose:
     return x, y, theta
 
 
+def _obstacle_rects(pc: ParkingConfig, lot: ParkingLot) -> List[Rect]:
+    """Scenario obstacles plus the user-placed obstacle (if any)."""
+    rects = list(obstacles_for(lot))
+    if pc.obstacle is not None:
+        x, y, w, h = pc.obstacle
+        rects.append(Rect(x, y, w, h))
+    return rects
+
+
 def plan_hybrid_astar(
     pc: ParkingConfig,
     cc: CarConfig,
     obstacles: Optional[Sequence[Rect]] = None,
 ) -> TrajectoryResult:
     lot = ParkingLot(pc, cc)
-    active_obstacles = list(obstacles) if obstacles is not None else obstacles_for(lot)
+    active_obstacles = list(obstacles) if obstacles is not None else _obstacle_rects(pc, lot)
     grid = OccupancyGrid(lot, obstacles=active_obstacles)
     planner = HybridAStarPlanner(lot, cc, grid)
     if pc.parking_type == "perpendicular":

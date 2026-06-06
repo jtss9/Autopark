@@ -27,6 +27,14 @@ GPS-denied 環境下的自主泊車規劃系統。不做 SLAM 建圖，專注於
 ### 可行域
 
 L 形區域 = `lane_rect ∪ spot_rect`，碰撞檢測使用完整矩形四角頂點。
+Hybrid A* 另對障礙物加做車身矩形 vs 障礙物矩形的 SAT（分離軸定理）精確相交，
+避免小障礙物卡在車身邊緣中段卻因四角未碰而漏判。
+
+### 程式結構
+
+`main.py` 為根目錄唯一的 Python 檔，其餘模組全部位於 `src/`；`main.py` 啟動時把
+`src/` 加入匯入路徑，所以模組沿用扁平 import。執行：根目錄 `python main.py`，
+輔助腳本 `python src/evaluate.py`。
 
 ### 場景參數範圍
 
@@ -50,16 +58,26 @@ L 形區域 = `lane_rect ∪ spot_rect`，碰撞檢測使用完整矩形四角�
 - 成功率：**10 %（1/10）**，平均規劃時間 0.19s
 - 僅適用於倒車入庫 + 無障礙 + 寬車道
 
-### 2. Multi-step MPC
+**提早停車（park then align）**：兩個 MPC 規劃器（垂直 / 平行）一旦偵測到整台車
+已落在車格內（`_pose_in_spot`）且航向與目標差 < `ALIGN_TOL = 8°`，即停止，不再跑完
+整條參考路徑（否則會繼續倒車撞到格底）。過程中記住「最對齊的入庫姿態」，若後續步驟
+將出界則截斷回該姿態並判定成功，而非碰撞。
 
-多次嘗試（最多 5 次），每次從當前姿態重新計算弧線並加入修正機動。
-關鍵 bug 修正：目標深度原本 cap 在 `y_end + 1.5m`，導致停在距目標 3.2m 處；修正後直接對準 `spot_top - 0.15m`。
+### 2. Parallel MPC（平行停車）
 
-- 修正後預設 6m 車道成功，最終誤差 0.086m
+`_plan_parallel` 以等半徑兩段 S 形弧線為參考（右打方向倒車 → 左打方向倒車回正），
+由 `Δy = 車道寬/2 + 車格寬/2`、`α = arccos(1 − Δy/2R)` 推導；`_plan_parallel_mpc`
+用同一套 `MPCController` 追蹤入庫。平行停車不再轉送 Hybrid A*。
+
+### 3. Multi-step MPC（UI 已隱藏）
+
+多次嘗試（最多 5 次），每次從當前姿態重新計算弧線並加入修正機動。仍可由
+`AUTOPARK_PLANNER=multi` 與評測器呼叫，但因難以泛化到不同車/格尺寸，已從設定 UI 隱藏。
+
 - 4.2m 窄車道（車長 3.8m）成功（Single-step 此處碰撞）
 - 剩餘限制：約 5m 車道 + 大車（R ≈ 4.18m）時仍可能碰到格邊緣
 
-### 3. Hybrid A\*
+### 4. Hybrid A\*
 
 在連續 SE(2) 狀態空間 (x, y, θ) 上做 A\* 搜尋。
 
@@ -93,7 +111,7 @@ L 形區域 = `lane_rect ∪ spot_rect`，碰撞檢測使用完整矩形四角�
 | Pillar Near Entry | 2/2 |
 | Parked Cars | 2/2 |
 
-### 4. Q-learning（表格型 RL，對照基準）
+### 5. Q-learning（表格型 RL，對照基準）
 
 - 狀態：(ix, iy, iθ)，0.45m × 12 heading bins；動作：10 種（前後 × 5 方向盤）
 - Reverse curriculum：先從靠近目標的位置訓練，逐漸推遠起點
@@ -131,9 +149,17 @@ L 形區域 = `lane_rect ∪ spot_rect`，碰撞檢測使用完整矩形四角�
 
 ---
 
-## 障礙物場景
+## 障礙物
 
-`ParkingConfig.obstacle_scenario` 選項：
+有兩條來源：
+
+**互動式（UI）**：planner 選 Hybrid A* 時，設定視窗出現「Add obstacle」勾選框，可
+拖曳一顆固定尺寸（0.9 m）障礙物，存為 `ParkingConfig.obstacle = (x, y, w, h)`。UI
+禁止放在車子（起點）或車格（終點）上。障礙物會畫在模擬畫面，並餵進 `plan_hybrid_astar`，
+由 `OccupancyGrid.pose_is_valid` 的角點 + SAT 車身檢查避開。
+
+**命名場景（評測器）**：`ParkingConfig.obstacle_scenario` 供 `evaluate.py` 使用，
+不在互動 UI 顯示：
 
 | 值 | 說明 |
 |---|---|
@@ -168,8 +194,8 @@ L 形區域 = `lane_rect ∪ spot_rect`，碰撞檢測使用完整矩形四角�
 ## 評測平台
 
 ```bash
-python evaluate.py --mode all --scenario all --planner all --track --output results/main.csv
-python plot_results.py results/main.csv   # 產生 results/figures/ 下的圖表
+python src/evaluate.py --mode all --scenario all --planner all --track --output results/main.csv
+python src/plot_results.py results/main.csv   # 產生 results/figures/ 下的圖表
 ```
 
 CLI 參數：`--mode`（perpendicular/parallel/all）、`--scenario`、`--sweep`（lane_width/car_size）、`--planner`、`--track`、`--output`
@@ -184,14 +210,14 @@ CLI 參數：`--mode`（perpendicular/parallel/all）、`--scenario`、`--sweep`
 | `parking_lot.py` | 場景幾何（`lane_rect`、`spot_rect`、`car_corners`） |
 | `geom.py` | 共用幾何工具（`angle_diff`、`wrap_pi`、`split_by_gear`） |
 | `controller.py` | `CarDynamics`（運動學）、`MPCController`（SLSQP） |
-| `trajectory.py` | `plan_trajectory()` 派送 + MPC 規劃器 + tracker 附掛 |
+| `trajectory.py` | `plan_trajectory()` 派送 + 垂直/平行 MPC 規劃器 + 提早停車 + tracker 附掛 |
 | `hybrid_astar.py` | Hybrid A\* + OccupancyGrid + Reeds-Shepp shot |
 | `reeds_shepp.py` | Reeds-Shepp 最短路徑（24-word 家族） |
 | `tracker.py` | Pure Pursuit 閉環追蹤器 |
 | `rl_qlearn.py` | 表格型 Q-learning 基準 |
 | `scenarios.py` | 各場景障礙物生成 |
 | `simulation.py` | pygame 動畫主迴圈 + HUD |
-| `settings_window.py` | tkinter 設定介面 |
+| `settings_window.py` | tkinter 設定介面 + 即時預覽 + 可拖曳障礙物 |
 | `evaluate.py` | 無頭批量評測 → CSV |
 | `plot_results.py` | CSV → matplotlib 圖表 |
 | `carla_bridge.py/controller.py/demo.py` | CARLA 延伸整合 |

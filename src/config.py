@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import math
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -26,3 +27,7 @@ class ParkingConfig:
     parking_type: str = "perpendicular"  # "perpendicular" | "parallel"
     obstacle_scenario: str = "none"       # "none" | "entry_blocker" | "tight_lane" | "pillar_near_entry" | "parked_cars"
     planner: str = "single"               # "single" | "multi" | "hybrid_astar" | "qlearn"
+    # Optional user-placed obstacle in world coords (x_left, y_bottom, w, h).
+    # Set by the settings window when Hybrid A* + obstacle are enabled.
+    # Carrier only — not yet consumed by the planner.
+    obstacle: Optional[Tuple[float, float, float, float]] = None

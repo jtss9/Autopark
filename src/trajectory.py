@@ -70,8 +70,7 @@ def plan_trajectory(
         else:
             result = _plan_perpendicular_mpc(pc, cc)
     elif pc.parking_type == "parallel":
-        from hybrid_astar import plan_hybrid_astar
-        result = plan_hybrid_astar(pc, cc)
+        result = _plan_parallel_mpc(pc, cc)
     else:
         return TrajectoryResult([], False, f"Unknown parking type: {pc.parking_type}")
 
@@ -131,15 +130,28 @@ def _goal_pose(lot: ParkingLot) -> tuple:
     return spot.x + spot.w / 2, spot.top - 0.15, -math.pi / 2
 
 
+def _pose_in_spot(lot: ParkingLot, x: float, y: float, theta: float,
+                  margin: float = 0.0) -> bool:
+    """True if all four car corners lie inside the spot rectangle.
+
+    A pose satisfying this is physically parked — the car body is wholly
+    within the bay — regardless of how much of the planned reference path
+    still remains. Used both for the final-state check and for early-stop
+    detection mid-maneuver.
+    """
+    spot = lot.spot_rect
+    return all(
+        spot.x - margin <= cx <= spot.right + margin
+        and spot.y - margin <= cy <= spot.top + margin
+        for cx, cy in lot.car_corners((x, y, theta))
+    )
+
+
 def _fully_in_spot(lot: ParkingLot, waypoints: List[Waypoint]) -> bool:
     if not waypoints:
         return False
-    spot = lot.spot_rect
     final = waypoints[-1]
-    return all(
-        spot.x <= x <= spot.right and spot.y <= y <= spot.top
-        for x, y in lot.car_corners((final.x, final.y, final.theta))
-    )
+    return _pose_in_spot(lot, final.x, final.y, final.theta)
 
 
 def _result_with_metrics(
@@ -322,6 +334,9 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
     goal       = ref.waypoints[-1]
     prev_delta = 0.0
     iterations = 0
+    best_idx   = None              # wps index of the most-aligned in-spot pose
+    best_herr  = float('inf')      # its heading error to the goal
+    ALIGN_TOL  = math.radians(8)   # heading tolerance for an aligned stop
 
     for _ in range(1500):
         iterations += 1
@@ -330,6 +345,11 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
         prev_delta = delta
 
         if not mpc.corners_in_bounds(car.x, car.y, car.theta):
+            # If we already captured a fully-parked pose, fall back to the best
+            # one (truncating any later drift) instead of reporting a collision.
+            if best_idx is not None:
+                del wps[best_idx + 1:]
+                break
             print(f" failed ({time.perf_counter() - t0:.1f}s)")
             wps.append(Waypoint(car.x, car.y, car.theta))  # include collision pose
             return _result_with_metrics(
@@ -339,6 +359,19 @@ def _plan_perpendicular_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResul
                 phase_starts, phase_names, time.perf_counter() - t0, iterations)
 
         wps.append(Waypoint(car.x, car.y, car.theta))
+
+        # Once the whole body is inside the spot, remember the most-aligned
+        # such pose so a later drift can never discard an already-valid park.
+        # Keep aligning until the heading matches the goal, then stop at the
+        # best pose — no need to finish the reference (which would clip the edge).
+        if _pose_in_spot(lot, car.x, car.y, car.theta):
+            herr = abs(_angle_diff(car.theta, goal.theta))
+            if herr < best_herr:
+                best_herr = herr
+                best_idx  = len(wps) - 1
+            if herr < ALIGN_TOL:
+                del wps[best_idx + 1:]
+                break
 
         dist = math.hypot(car.x - goal.x, car.y - goal.y)
         dh   = abs((car.theta - goal.theta + math.pi) % (2 * math.pi) - math.pi)
@@ -547,3 +580,209 @@ def _plan_perpendicular_multistep(pc: ParkingConfig, cc: CarConfig) -> Trajector
         wps, False,
         f"Could not park within {MAX_ATTEMPTS} attempts.",
         phase_starts, phase_names, time.perf_counter() - t0, iterations)
+
+
+# ---------------------------------------------------------------------------
+# Parallel (路邊停車) geometric reference
+# ---------------------------------------------------------------------------
+def _plan_parallel(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResult:
+    """
+    S-curve geometric reference for parallel (roadside) parking.
+
+    Coordinate layout: spot is BELOW the lane (y ∈ [−spot_width, 0]).
+    Goal: rear axle centred at (x_goal, −spot_width/2, θ=0).
+
+    Two equal-radius arcs:
+      Arc 1 — right-steer reverse: ICR at (x_stop, y₀−R), θ: 0 → +α
+      Arc 2 — left-steer  reverse: ICR derived from arc-1 end,  θ: +α → 0
+
+    Key equations:
+      Δy    = lane_width/2 + spot_width/2
+      α     = arccos(1 − Δy / (2R))        (feasible iff Δy ≤ 2R)
+      x_stop = x_goal + 2R·sin α
+    """
+    lot = ParkingLot(pc, cc)
+    R   = cc.min_turn_radius
+    y0  = pc.lane_width / 2
+    y_goal  = -pc.spot_width / 2
+    delta_y = y0 - y_goal          # lane_width/2 + spot_width/2
+
+    feasible = True
+    message  = "OK"
+
+    if not lot.car_fits():
+        feasible = False
+        message  = "Car is larger than the parking spot."
+
+    if delta_y > 2 * R and feasible:
+        feasible = False
+        message  = (f"Infeasible: need Δy={delta_y:.2f} m but 2R={2*R:.2f} m. "
+                    f"Try a wider lane/spot or a car with smaller turn radius.")
+
+    alpha  = math.acos(max(-1.0, min(1.0, 1.0 - min(delta_y, 2 * R) / (2 * R))))
+    x_goal = lot.spot_rect.x + max(0.0, (lot.spot_rect.w - cc.length) / 2)
+    x_stop = x_goal + 2 * R * math.sin(alpha)
+
+    if x_stop > lot.lane_rect.right - 0.15 and feasible:
+        feasible = False
+        message  = (f"Not enough lane ahead of spot "
+                    f"(need x_stop={x_stop:.1f} m, lane ends at "
+                    f"{lot.lane_rect.right:.1f} m).")
+        x_stop = lot.lane_rect.right - 0.15
+
+    x_start, _, _ = lot.car_start_pose
+    STEP  = 0.05
+    n_arc = max(90, int(math.degrees(alpha) * 3))
+
+    wps:          List[Waypoint] = []
+    phase_starts: List[int]      = []
+    phase_names:  List[str]      = []
+
+    # Phase 1: drive forward to x_stop
+    phase_starts.append(0)
+    phase_names.append("Drive forward")
+    x = x_start
+    while x < x_stop - STEP / 2:
+        wps.append(Waypoint(x, y0, 0.0))
+        x += STEP
+    wps.append(Waypoint(x_stop, y0, 0.0))
+
+    # Phase 2: Arc 1 — right-steer reverse, θ: 0 → +α
+    # ICR₁ = (x_stop, y₀−R); car rotates CCW about ICR₁
+    phase_starts.append(len(wps))
+    phase_names.append("Reversing - arc 1")
+    icr1_x, icr1_y = x_stop, y0 - R
+    for i in range(n_arc + 1):
+        t  = alpha * i / n_arc
+        wps.append(Waypoint(icr1_x - R * math.sin(t),
+                            icr1_y + R * math.cos(t),   # = y0 - R*(1-cos t)
+                            t))
+
+    x_mid = icr1_x - R * math.sin(alpha)
+    y_mid = icr1_y + R * math.cos(alpha)
+
+    # Phase 3: Arc 2 — left-steer reverse, θ: +α → 0
+    # ICR₂ = (x_mid − R·sin α, y_mid + R·cos α); car rotates CW about ICR₂
+    phase_starts.append(len(wps))
+    phase_names.append("Reversing - arc 2")
+    icr2_x = x_mid - R * math.sin(alpha)
+    icr2_y = y_mid + R * math.cos(alpha)
+    for i in range(n_arc + 1):
+        t  = alpha * i / n_arc
+        wps.append(Waypoint(icr2_x + R * math.sin(alpha - t),
+                            icr2_y - R * math.cos(alpha - t),
+                            alpha - t))
+
+    return TrajectoryResult(wps, feasible, message, phase_starts, phase_names)
+
+
+# ---------------------------------------------------------------------------
+# Parallel MPC planner
+# ---------------------------------------------------------------------------
+def _plan_parallel_mpc(pc: ParkingConfig, cc: CarConfig) -> TrajectoryResult:
+    """
+    MPC planner for parallel parking.  Mirrors _plan_perpendicular_mpc:
+      Phase 1 — straight forward to x_stop (no MPC).
+      Phase 2 — MPC tracks the S-curve reference into the spot.
+    """
+    from controller import CarDynamics, MPCController
+
+    ref = _plan_parallel(pc, cc)
+
+    lot     = ParkingLot(pc, cc)
+    R       = cc.min_turn_radius
+    y0      = pc.lane_width / 2
+    delta_y = y0 - (-pc.spot_width / 2)
+    alpha   = math.acos(max(-1.0, min(1.0, 1.0 - min(delta_y, 2 * R) / (2 * R))))
+    x_goal  = lot.spot_rect.x + max(0.0, (lot.spot_rect.w - cc.length) / 2)
+    x_stop  = min(x_goal + 2 * R * math.sin(alpha), lot.lane_rect.right - 0.15)
+
+    x0, y_lane, th0 = lot.car_start_pose
+    car = CarDynamics(x0, y_lane, th0, cc)
+    mpc = MPCController(lot, cc, ref.waypoints)
+
+    FORWARD_V = 3.0
+    REVERSE_V = 1.5
+    dt        = mpc.dt
+
+    p1_end = ref.phase_starts[1] if len(ref.phase_starts) > 1 else len(ref.waypoints)
+
+    wps:          List[Waypoint] = [Waypoint(car.x, car.y, car.theta)]
+    phase_starts: List[int]      = [0]
+    phase_names:  List[str]      = ["Drive forward"]
+
+    t0 = time.perf_counter()
+    print("Planning parallel MPC trajectory...", end="", flush=True)
+
+    # ── Phase 1: straight forward to x_stop ──────────────────────────────────
+    while car.x < x_stop - 0.05:
+        car.step(FORWARD_V, 0.0, dt)
+        wps.append(Waypoint(car.x, car.y, car.theta))
+        if not mpc.corners_in_bounds(car.x, car.y, car.theta):
+            print(f" failed ({time.perf_counter() - t0:.1f}s)")
+            return _result_with_metrics(
+                pc, cc, wps, False,
+                "Car body exceeded valid area during forward drive.",
+                phase_starts, phase_names, time.perf_counter() - t0, len(wps))
+
+    # ── Phase 2: MPC reverse S-curve into spot ────────────────────────────────
+    phase_starts.append(len(wps))
+    phase_names.append("Reversing (MPC)")
+    mpc.ref_idx = p1_end
+
+    goal       = ref.waypoints[-1]
+    prev_delta = 0.0
+    iterations = 0
+    best_idx   = None              # wps index of the most-aligned in-spot pose
+    best_herr  = float('inf')      # its heading error to the goal
+    ALIGN_TOL  = math.radians(8)   # heading tolerance for an aligned stop
+
+    for _ in range(2000):
+        iterations += 1
+        delta = mpc.optimize(car, -REVERSE_V, prev_delta)
+        car.step(-REVERSE_V, delta, dt)
+        prev_delta = delta
+
+        if not mpc.corners_in_bounds(car.x, car.y, car.theta):
+            # If we already captured a fully-parked pose, fall back to the best
+            # one (truncating any later drift) instead of reporting a collision.
+            if best_idx is not None:
+                del wps[best_idx + 1:]
+                break
+            print(f" failed ({time.perf_counter() - t0:.1f}s)")
+            wps.append(Waypoint(car.x, car.y, car.theta))
+            return _result_with_metrics(
+                pc, cc, wps, False,
+                "Car body exceeded valid area — try wider lane/spot or smaller car.",
+                phase_starts, phase_names, time.perf_counter() - t0, iterations)
+
+        wps.append(Waypoint(car.x, car.y, car.theta))
+
+        # Once the whole body is inside the spot, remember the most-aligned
+        # such pose so a later drift can never discard an already-valid park.
+        # Keep aligning until the heading matches the goal, then stop at the
+        # best pose — no need to finish the reference (which would clip the edge).
+        if _pose_in_spot(lot, car.x, car.y, car.theta):
+            herr = abs(_angle_diff(car.theta, goal.theta))
+            if herr < best_herr:
+                best_herr = herr
+                best_idx  = len(wps) - 1
+            if herr < ALIGN_TOL:
+                del wps[best_idx + 1:]
+                break
+
+        dist = math.hypot(car.x - goal.x, car.y - goal.y)
+        dh   = abs((car.theta - goal.theta + math.pi) % (2 * math.pi) - math.pi)
+        if dist < 0.15 and dh < 0.1:
+            break
+    else:
+        print(f" timed out ({time.perf_counter() - t0:.1f}s)")
+        return _result_with_metrics(
+            pc, cc, wps, False,
+            "MPC: could not reach parking goal within step limit.",
+            phase_starts, phase_names, time.perf_counter() - t0, iterations)
+
+    elapsed = time.perf_counter() - t0
+    print(f" done in {elapsed:.1f}s ({len(wps)} waypoints)")
+    return _result_with_metrics(
+        pc, cc, wps, True, "OK", phase_starts, phase_names, elapsed, iterations)

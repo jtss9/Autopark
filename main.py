@@ -2,7 +2,12 @@
 Entry point: launches the settings window, then the simulation.
 Pressing S in the simulation returns to the settings window.
 """
+import os
 import sys
+
+# All source modules live in src/. Put it on the import path so the flat
+# `from config import ...` imports used throughout the codebase keep working.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from settings_window import SettingsWindow
 from simulation import Simulation

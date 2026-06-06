@@ -89,6 +89,11 @@ class Simulation:
             obstacles=self._obstacles,
         )
 
+        # User-placed obstacle from the settings window: (x, y, w, h) or None.
+        # Drawn for reference only — NOT fed into the planner or the occupancy
+        # grid yet, so the calculation is unchanged.
+        self._user_obstacle = self.pc.obstacle
+
     def _effective_planner_name(self, requested_planner: str) -> str:
         if requested_planner == "hybrid_astar":
             return "hybrid_astar"
@@ -237,6 +242,16 @@ class Simulation:
                                 abs(ox2 - ox1), abs(oy2 - oy1))
             pygame.draw.rect(surf, C_OBSTACLE, obs_r)
             pygame.draw.rect(surf, C_OBS_LINE, obs_r, 1)
+
+        # User-placed obstacle (settings window) — reference overlay only
+        if self._user_obstacle is not None:
+            ux, uy, uw, uh = self._user_obstacle
+            px1, py1 = self.w2s(ux, uy + uh)
+            px2, py2 = self.w2s(ux + uw, uy)
+            u_r = pygame.Rect(min(px1, px2), min(py1, py2),
+                              abs(px2 - px1), abs(py2 - py1))
+            pygame.draw.rect(surf, C_OBSTACLE, u_r)
+            pygame.draw.rect(surf, C_OBS_LINE, u_r, 2)
 
         # Planned path + travelled path
         self._draw_path(surf, step)

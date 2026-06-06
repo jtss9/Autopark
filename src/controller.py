@@ -74,27 +74,27 @@ class MPCController:
 
     def _boundary_penalty(self, x, y, theta) -> float:
         """
-        Squared-distance penalty for every car corner that violates:
-          - bottom of lane (y < 0)
-          - top of spot   (y > spot.top)
-          - left/right road edges
-          - spot x-range when the corner is above the lane
+        Squared-distance penalty for every car corner outside lane ∪ spot.
+        Works for both perpendicular (spot above lane) and parallel (spot below lane).
+        Outside the lane vertically → corner must be within spot x-range.
         """
         corners = self.lot.car_corners((x, y, theta))
         lane = self.lot.lane_rect
         spot = self.lot.spot_rect
+        bottom = min(lane.y, spot.y)
+        top    = max(lane.top, spot.top)
         pen = 0.0
         for cx, cy in corners:
-            if cy < lane.y:
-                pen += (lane.y - cy) ** 2
-            if cy > spot.top:
-                pen += (cy - spot.top) ** 2
+            if cy < bottom:
+                pen += (bottom - cy) ** 2
+            if cy > top:
+                pen += (cy - top) ** 2
             if cx < lane.x:
                 pen += (lane.x - cx) ** 2
             if cx > lane.right:
                 pen += (cx - lane.right) ** 2
-            # above lane → must be within spot x-range
-            if cy > lane.top:
+            # outside lane vertically → must be within spot x-range
+            if cy > lane.top or cy < lane.y:
                 if cx < spot.x:
                     pen += (spot.x - cx) ** 2
                 elif cx > spot.right:
@@ -170,32 +170,39 @@ class MPCController:
 
     def corners_warn(self, x: float, y: float, theta: float,
                      warn_margin: float = 0.20) -> bool:
-        """True if every corner has at least warn_margin clearance from every boundary."""
+        """True if every corner has at least warn_margin clearance from every boundary.
+        Works for both perpendicular and parallel layouts."""
         corners = self.lot.car_corners((x, y, theta))
         lane = self.lot.lane_rect
         spot = self.lot.spot_rect
+        bottom = min(lane.y, spot.y)
+        top    = max(lane.top, spot.top)
         for cx, cy in corners:
-            if cy < lane.y + warn_margin:         return False
-            if cy > spot.top - warn_margin:       return False
+            if cy < bottom + warn_margin:         return False
+            if cy > top   - warn_margin:          return False
             if cx < lane.x + warn_margin:         return False
             if cx > lane.right - warn_margin:     return False
-            if cy > lane.top - warn_margin:
+            if cy > lane.top - warn_margin or cy < lane.y + warn_margin:
                 if cx < spot.x + warn_margin:     return False
                 if cx > spot.right - warn_margin: return False
         return True
 
     def corners_in_bounds(self, x: float, y: float, theta: float,
                           margin: float = 0.05) -> bool:
-        """True if every car corner is within lane ∪ spot (with margin)."""
+        """True if every car corner is within lane ∪ spot (with margin).
+        Works for both perpendicular (spot above lane) and parallel (spot below lane)."""
         corners = self.lot.car_corners((x, y, theta))
         lane = self.lot.lane_rect
         spot = self.lot.spot_rect
+        bottom = min(lane.y, spot.y)
+        top    = max(lane.top, spot.top)
         for cx, cy in corners:
-            if cy < lane.y - margin or cy > spot.top + margin:
+            if cy < bottom - margin or cy > top + margin:
                 return False
             if cx < lane.x - margin or cx > lane.right + margin:
                 return False
-            if cy > lane.top + margin:
+            # outside lane vertically → must be within spot x-range
+            if cy > lane.top + margin or cy < lane.y - margin:
                 if cx < spot.x - margin or cx > spot.right + margin:
                     return False
         return True

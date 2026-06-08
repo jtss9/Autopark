@@ -56,6 +56,9 @@ def plan_trajectory(
     if effective == "qlearn":
         from rl_qlearn import plan_qlearn
         result = plan_qlearn(pc, cc)
+    elif effective in ("sac", "rl_sac"):
+        from rl_sac import plan_sac
+        result = plan_sac(pc, cc)
     elif effective == "hybrid_astar":
         from hybrid_astar import plan_hybrid_astar
         result = plan_hybrid_astar(pc, cc)

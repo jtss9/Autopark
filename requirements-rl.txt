@@ -1,0 +1,24 @@
+# Optional dependencies for RL training (SAC + curriculum learning).
+# Install with: pip install -r requirements-rl.txt
+#
+# GPU is NOT required. The SAC networks are small 2-layer MLPs and the
+# environment is a simple kinematic simulation, so training runs fine on
+# CPU (5-15 min for 500k steps). A CUDA GPU gives ~2-3x speedup but is
+# purely optional.
+#
+# To force CPU even when CUDA is available, pass device="cpu" to train_sac()
+# or use: python src/rl_sac.py --device cpu
+
+# Core RL framework (requires Python <=3.12; 3.13 breaks torch.save via pickle)
+gymnasium>=1.2.3
+stable-baselines3>=2.8.0
+torch>=2.12.0
+
+# Logging (optional but recommended)
+tensorboard>=2.20.0
+
+# Base project dependencies (also in requirements.txt)
+pygame>=2.6.1
+Pillow>=12.2.0
+scipy>=1.17.1
+numpy>=2.4.6

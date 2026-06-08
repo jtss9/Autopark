@@ -73,7 +73,7 @@ SCENARIO_CHOICES = (
     *SCENARIO_NAMES,
 )
 SWEEP_CHOICES = ("lane_width", "spot_size", "car_size", "none")
-PLANNER_CHOICES = ("baseline", "hybrid_astar", "qlearn", "all")
+PLANNER_CHOICES = ("baseline", "hybrid_astar", "qlearn", "sac", "all")
 
 
 def _path_length(result: TrajectoryResult) -> float:
@@ -216,7 +216,7 @@ def _scenarios(selected: str) -> Sequence[str]:
 
 def _planners(selected: str) -> Sequence[str]:
     if selected == "all":
-        return ("baseline", "hybrid_astar", "qlearn")
+        return ("baseline", "hybrid_astar", "qlearn", "sac")
     return (selected,)
 
 
@@ -282,6 +282,8 @@ def run_case(
         requested_planner = "multi" if pc.lane_width < 4.5 else "single"
     elif planner == "qlearn":
         requested_planner = "qlearn"
+    elif planner == "sac":
+        requested_planner = "sac"
     else:
         requested_planner = "hybrid_astar"
 

@@ -26,7 +26,7 @@ class ParkingConfig:
     spot_width: float = 2.5
     parking_type: str = "perpendicular"  # "perpendicular" | "parallel"
     obstacle_scenario: str = "none"       # "none" | "entry_blocker" | "tight_lane" | "pillar_near_entry" | "parked_cars"
-    planner: str = "single"               # "single" | "multi" | "hybrid_astar" | "qlearn"
+    planner: str = "single"               # "single" | "multi" | "hybrid_astar" | "qlearn" | "sac"
     # Optional user-placed obstacle in world coords (x_left, y_bottom, w, h).
     # Set by the settings window when Hybrid A* + obstacle are enabled.
     # Carrier only — not yet consumed by the planner.

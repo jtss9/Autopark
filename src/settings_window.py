@@ -177,6 +177,7 @@ class SettingsWindow:
         planner_frame.grid(row=n * 2 + 3, column=0, sticky="w")
         for text, value in (("Single-step MPC", "single"),
                             ("Hybrid A*",        "hybrid_astar"),
+                            ("SAC (RL)",         "sac"),
                             ("Q-learning (RL)",  "qlearn")):
             self._seg_radio(planner_frame, text, self.var_planner, value).pack(
                 side="left", padx=3)

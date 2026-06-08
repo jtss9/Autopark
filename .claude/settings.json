@@ -1,0 +1,9 @@
+{
+    "statusLine": {
+        "type": "command",
+        "command": "bash /tmp3/Mason/.claude/statusline-command.sh"
+    },
+    "env": {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-6[1m]"
+    }
+}

@@ -85,10 +85,13 @@ class ResidualParkingEnv(gym.Env):
         parking_config: Optional[ParkingConfig] = None,
         car_config: Optional[CarConfig] = None,
         max_episode_steps: int = 600,
-        residual_scale: float = 0.3,
+        # Must match the scale used at training time — the policy's outputs
+        # are calibrated to it (train_residual also defaults to 0.15).
+        residual_scale: float = 0.15,
         dt: float = 0.1,
         max_speed: float = 2.0,
         seed: Optional[int] = None,
+        curriculum_stage: int = 0,
     ):
         super().__init__()
         self.pc = parking_config or ParkingConfig()
@@ -103,6 +106,7 @@ class ResidualParkingEnv(gym.Env):
             dt=dt,
             max_speed=max_speed,
             seed=seed,
+            curriculum_stage=curriculum_stage,
         )
 
         self._plan_base_trajectory()
@@ -120,98 +124,83 @@ class ResidualParkingEnv(gym.Env):
         )
 
         self._step_count = 0
-        self._wp_idx = 0
+        self._seg_idx = 0
+        self._seg_wp_idx = 0
+
+    @property
+    def lot(self):
+        return self._inner.lot
+
+    @property
+    def grid(self):
+        return self._inner.grid
 
     def _plan_base_trajectory(self):
-        """Pre-compute the A* reference trajectory and densify it."""
-        plan_pc = ParkingConfig(
-            parking_type=self.pc.parking_type,
-            planner="hybrid_astar",
-            lane_width=self.pc.lane_width,
-            spot_length=self.pc.spot_length,
-            spot_width=self.pc.spot_width,
-        )
-        result = plan_trajectory(plan_pc, self.cc)
-        if result.feasible:
-            self._ref_wps = _interpolate_waypoints(
-                result.waypoints, self._inner.dt, self._inner.max_speed
-            )
-        else:
-            self._ref_wps = [Waypoint(*self._inner.lot.car_start_pose)]
+        """Gear-split, densified reference from the inner env's hybrid A*
+        path (planned with body/steering margin — see rl_env)."""
+        from trajectory import _densify_for_tracking
+        from geom import split_by_gear
 
-        # Precompute forward/reverse per segment
-        self._seg_reverse = []
-        for i in range(1, len(self._ref_wps)):
-            dx = self._ref_wps[i].x - self._ref_wps[i - 1].x
-            dy = self._ref_wps[i].y - self._ref_wps[i - 1].y
-            fwd = (dx * math.cos(self._ref_wps[i - 1].theta)
-                   + dy * math.sin(self._ref_wps[i - 1].theta))
-            self._seg_reverse.append(fwd < -0.001)
+        if self._inner._ref_path is not None:
+            wps = [Waypoint(x, y, th) for x, y, th in self._inner._ref_path]
+            dense = _densify_for_tracking(wps, max_step=0.15)
+            self._segments = split_by_gear(dense)
+        else:
+            self._segments = []
+        self._total_wps = sum(len(seg) for _, seg in self._segments) or 1
+
+    def _locate_on_path(self, pose: Tuple[float, float, float]) -> None:
+        """Initialise (segment, waypoint) indices to the path point nearest
+        to ``pose`` so the base controller works from curriculum starts."""
+        best = (0, 0, float("inf"))
+        for si, (_, seg) in enumerate(self._segments):
+            for wi, wp in enumerate(seg):
+                d2 = (wp.x - pose[0]) ** 2 + (wp.y - pose[1]) ** 2
+                ang = angle_diff(wp.theta, pose[2])
+                score = d2 + 2.0 * ang * ang
+                if score < best[2]:
+                    best = (si, wi, score)
+        self._seg_idx, self._seg_wp_idx = best[0], best[1]
 
     def _base_action(self) -> Tuple[float, float]:
-        """Compute the A* base controller action for the current state."""
-        if self._wp_idx >= len(self._ref_wps):
+        """Gear-aware pure-pursuit base action (same controller that tracks
+        the reference 100% in the demo collector)."""
+        from rl_train import _pure_pursuit_step
+
+        car = self._inner._car
+        while self._seg_idx < len(self._segments):
+            _, seg = self._segments[self._seg_idx]
+            end = seg[-1]
+            if math.hypot(end.x - car.x, end.y - car.y) < 0.12:
+                self._seg_idx += 1
+                self._seg_wp_idx = 0
+                continue
+            break
+        if self._seg_idx >= len(self._segments):
             return 0.0, 0.0
 
-        cx, cy, ct = self._inner._car.x, self._inner._car.y, self._inner._car.theta
-
-        # Advance waypoint index past reached points
-        while self._wp_idx < len(self._ref_wps) - 1:
-            wp = self._ref_wps[self._wp_idx]
-            if math.hypot(wp.x - cx, wp.y - cy) > 0.3:
-                break
-            self._wp_idx += 1
-
-        # Lookahead target
-        lookahead_idx = min(self._wp_idx + 3, len(self._ref_wps) - 1)
-        target = self._ref_wps[lookahead_idx]
-
-        dx = target.x - cx
-        dy = target.y - cy
-        dist = math.hypot(dx, dy)
-
-        is_rev = (self._wp_idx < len(self._seg_reverse)
-                  and self._seg_reverse[self._wp_idx])
-
-        # Transform to local frame
-        local_x = dx * math.cos(ct) + dy * math.sin(ct)
-        local_y = -dx * math.sin(ct) + dy * math.cos(ct)
-
-        if is_rev:
-            local_x = -local_x
-            local_y = -local_y
-
-        # Pure pursuit steering
-        if abs(local_x) > 0.01:
-            curvature = 2.0 * local_y / (local_x ** 2 + local_y ** 2)
-            steer_angle = math.atan(curvature * self.cc.wheelbase)
-        else:
-            steer_angle = math.copysign(self.cc.max_steer * 0.3, local_y)
-
-        steer = float(np.clip(steer_angle / self.cc.max_steer, -1.0, 1.0))
-
-        # Speed: slow, proportional to distance, with approach slowdown
-        remaining = len(self._ref_wps) - 1 - self._wp_idx
-        approach = min(1.0, remaining / 10.0)
-        steer_slow = 1.0 - 0.5 * abs(steer)
-        speed_mag = float(np.clip(dist * 0.5 * steer_slow * approach, 0.05, 0.25))
-        speed = -speed_mag if is_rev else speed_mag
-
-        return steer, speed
+        gear, seg = self._segments[self._seg_idx]
+        action, self._seg_wp_idx = _pure_pursuit_step(
+            self._inner, seg, gear, self._seg_wp_idx
+        )
+        return float(action[0]), float(action[1])
 
     def _make_obs(self, inner_obs: np.ndarray, base_steer: float, base_speed: float) -> np.ndarray:
-        progress = self._wp_idx / max(1, len(self._ref_wps) - 1)
+        consumed = sum(
+            len(self._segments[i][1]) for i in range(min(self._seg_idx, len(self._segments)))
+        ) + self._seg_wp_idx
+        progress = consumed / self._total_wps
         return np.concatenate([
             inner_obs,
             np.array([base_steer, base_speed, progress], dtype=np.float32),
         ])
 
     def reset(self, *, seed=None, options=None):
-        if options is None:
-            options = {"start_pose": self._inner.lot.car_start_pose}
         inner_obs, info = self._inner.reset(seed=seed, options=options)
         self._step_count = 0
-        self._wp_idx = 0
+        self._locate_on_path(
+            (self._inner._car.x, self._inner._car.y, self._inner._car.theta)
+        )
         base_steer, base_speed = self._base_action()
         obs = self._make_obs(inner_obs, base_steer, base_speed)
         return obs, info
@@ -233,23 +222,15 @@ class ResidualParkingEnv(gym.Env):
         final_action = np.array([final_steer, final_speed], dtype=np.float32)
         inner_obs, reward, terminated, truncated, info = self._inner.step(final_action)
 
-        # Add bonus for following the reference closely
-        if self._wp_idx < len(self._ref_wps):
-            ref = self._ref_wps[min(self._wp_idx, len(self._ref_wps) - 1)]
-            track_err = math.hypot(
-                self._inner._car.x - ref.x,
-                self._inner._car.y - ref.y,
-            )
-            reward += max(0, 0.5 - track_err) * 0.2
-
-        # Small penalty for large residuals (encourage staying close to base)
+        # Small penalty for large residuals (encourage staying close to base).
+        # No per-step path-following bonus: positive state bonuses reward
+        # loitering, and the inner potential already penalises deviation.
         reward -= 0.1 * (abs(residual_steer) + abs(residual_speed))
 
         info["base_steer"] = base_steer
         info["base_speed"] = base_speed
         info["residual_steer"] = residual_steer
         info["residual_speed"] = residual_speed
-        info["wp_progress"] = self._wp_idx / max(1, len(self._ref_wps) - 1)
 
         # Recompute base action for next obs
         next_base_steer, next_base_speed = self._base_action()
@@ -270,8 +251,8 @@ class ResidualParkingEnv(gym.Env):
 
 def train_residual(
     pc: ParkingConfig, cc: CarConfig,
-    total_timesteps: int = 1_000_000,
-    residual_scale: float = 0.3,
+    total_timesteps: int = 300_000,
+    residual_scale: float = 0.15,
     seed: int = 0, verbose: int = 1, device: str = "auto",
 ) -> SAC:
     if device == "auto":
@@ -280,12 +261,14 @@ def train_residual(
     env = ResidualParkingEnv(
         parking_config=pc, car_config=cc,
         residual_scale=residual_scale, seed=seed,
+        curriculum_stage=3,
     )
     env = Monitor(env)
 
     eval_env = ResidualParkingEnv(
         parking_config=pc, car_config=cc,
         residual_scale=residual_scale, seed=seed + 1000,
+        curriculum_stage=3,
     )
 
     model = SAC(
@@ -299,13 +282,23 @@ def train_residual(
         gamma=0.99,
         train_freq=1,
         gradient_steps=1,
-        ent_coef="auto",
+        # Start the entropy coefficient low: with alpha ~1.0 the first actor
+        # updates maximise entropy and drift the mean residual away from
+        # zero, destroying the (already successful) base controller.
+        ent_coef="auto_0.05",
+        target_entropy=-4.0,
         verbose=verbose,
         seed=seed,
         device=device,
         tensorboard_log=str(LOG_DIR / "residual" / "tensorboard"),
         policy_kwargs=dict(net_arch=[256, 256]),
     )
+
+    # Zero-init the actor mean head: the deterministic policy then starts as
+    # exactly the base controller (zero residual, 100% fixed-start success)
+    # and RL only refines from there.
+    model.policy.actor.mu.weight.data.zero_()
+    model.policy.actor.mu.bias.data.zero_()
 
     save_dir = str(CHECKPOINT_DIR / "residual" / "best")
     os.makedirs(save_dir, exist_ok=True)
@@ -319,15 +312,97 @@ def train_residual(
         deterministic=True,
     )
 
+    from rl_train import FixedStartEvalCallback
+    fixed_cb = FixedStartEvalCallback(
+        pc, cc,
+        save_path=str(CHECKPOINT_DIR / "residual" / "best_fixed" / "model"),
+        eval_freq=10_000, n_episodes=10, verbose=verbose,
+        env=ResidualParkingEnv(
+            parking_config=pc, car_config=cc,
+            residual_scale=residual_scale, seed=123,
+        ),
+    )
+
     save_path = str(CHECKPOINT_DIR / "residual" / "final")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     print(f"[Residual SAC] Training for {total_timesteps} steps on {device}...")
     print(f"  residual_scale={residual_scale}")
-    model.learn(total_timesteps=total_timesteps, callback=[eval_cb])
+    model.learn(total_timesteps=total_timesteps, callback=[eval_cb, fixed_cb])
     model.save(save_path)
     print(f"[Residual SAC] Saved to {save_path}")
     return model
+
+
+# ---------------------------------------------------------------------------
+# Trajectory generation (for the simulator / plan_trajectory dispatch)
+# ---------------------------------------------------------------------------
+
+def rollout_residual(
+    model: SAC,
+    pc: Optional[ParkingConfig] = None,
+    cc: Optional[CarConfig] = None,
+    max_steps: int = 600,
+    deterministic: bool = True,
+    use_lot_start: bool = True,
+):
+    """Roll out base controller + residual policy; return a TrajectoryResult."""
+    from geom import angle_diff as _angle_diff, path_length as _path_length
+    from trajectory import TrajectoryResult
+
+    pc = pc or ParkingConfig()
+    cc = cc or CarConfig()
+    env = ResidualParkingEnv(
+        parking_config=pc, car_config=cc, max_episode_steps=max_steps,
+    )
+
+    options = None
+    if use_lot_start:
+        options = {"start_pose": env.lot.car_start_pose}
+    obs, info = env.reset(options=options)
+    car = env._inner._car
+    waypoints = [Waypoint(car.x, car.y, car.theta)]
+
+    success = False
+    collision = False
+    for _ in range(max_steps):
+        action, _ = model.predict(obs, deterministic=deterministic)
+        obs, reward, terminated, truncated, info = env.step(action)
+        waypoints.append(Waypoint(car.x, car.y, car.theta))
+        if terminated or truncated:
+            success = info.get("is_success", False)
+            collision = info.get("collision", False)
+            break
+
+    goal = env._inner._goal_pose
+    final = waypoints[-1]
+    metrics = {
+        "planner_kind": "residual_sac",
+        "path_length_m": _path_length(waypoints),
+        "waypoints": len(waypoints),
+        "final_pos_error_m": math.hypot(final.x - goal[0], final.y - goal[1]),
+        "final_heading_error_deg": math.degrees(
+            abs(_angle_diff(final.theta, goal[2]))),
+        "fully_in_spot": success,
+        "episode_steps": len(waypoints) - 1,
+        "collision": collision,
+        "gear_switches": info.get("gear_switches", 0),
+    }
+    if success:
+        message = "Residual SAC: successfully parked."
+    elif collision:
+        message = "Residual SAC: collision during rollout."
+    else:
+        message = "Residual SAC: exceeded step limit without parking."
+
+    return TrajectoryResult(
+        waypoints=waypoints,
+        feasible=success,
+        message=message,
+        phase_starts=[0],
+        phase_names=["Residual SAC rollout"],
+        metrics=metrics,
+    )
 
 
 # ---------------------------------------------------------------------------

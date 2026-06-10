@@ -298,11 +298,42 @@ def plan_sac(
     if device == "auto":
         device = _default_device()
 
+    # Deployment preference (head-to-head, 100 episodes, 2026-06-10):
+    # pure SAC best_fixed 94% overall / 100% fixed / 0 collisions beats
+    # residual SAC (82%/100%) and the pure-pursuit base (87%/100%), so plain
+    # SAC checkpoints are tried first and residual SAC is the fallback.
+    if model_path is None and not os.path.exists(
+        str(CHECKPOINT_DIR / "sac" / "best_fixed" / "model.zip")
+    ):
+        residual_candidates = [
+            str(CHECKPOINT_DIR / "residual" / "best_fixed" / "model.zip"),
+            str(CHECKPOINT_DIR / "residual" / "best" / "best_model.zip"),
+        ]
+        for path in residual_candidates:
+            if os.path.exists(path):
+                from rl_residual import rollout_residual
+                print(f"Loading residual SAC model from {path}...",
+                      end="", flush=True)
+                start_t = time.perf_counter()
+                model = load_sac(path, device=device)
+                result = rollout_residual(model, pc=pc, cc=cc,
+                                          use_lot_start=True)
+                elapsed = time.perf_counter() - start_t
+                result.metrics["planning_time_s"] = elapsed
+                if result.feasible:
+                    print(f" done in {elapsed:.1f}s "
+                          f"({len(result.waypoints)} waypoints)")
+                else:
+                    print(f" failed ({elapsed:.1f}s): {result.message}")
+                return result
+
     # Prefer the best eval checkpoint over the final one
     candidates = []
     if model_path:
         candidates.append(model_path)
     candidates.extend([
+        # Selected by fixed-start success — the metric main.py cares about.
+        str(CHECKPOINT_DIR / "sac" / "best_fixed" / "model.zip"),
         str(CHECKPOINT_DIR / "sac" / "best" / "best_model.zip"),
         str(CHECKPOINT_DIR / "best" / "best_model.zip"),
         str(CHECKPOINT_DIR / "sac" / "final.zip"),

@@ -33,8 +33,12 @@ except ImportError as e:
 
 import torch
 
+# Small MLPs + many-core servers: unbounded OpenMP threads thrash. Four
+# threads measured ~2.4x faster than the default on this workload.
+torch.set_num_threads(4)
+
 from config import CarConfig, ParkingConfig
-from geom import angle_diff as _angle_diff, path_length as _path_length
+from geom import angle_diff as _angle_diff, path_length as _path_length, split_by_gear
 from rl_env import ParkingEnv, CURRICULUM_STAGES
 from trajectory import TrajectoryResult, Waypoint
 
@@ -48,69 +52,114 @@ ALGO_REGISTRY = {}
 # Demonstration seeding: replay expert trajectories into the replay buffer
 # ---------------------------------------------------------------------------
 
+def _pure_pursuit_step(env: ParkingEnv, seg: List[Waypoint], gear: int,
+                       wp_idx: int, lookahead: float = 0.6,
+                       ) -> Tuple[np.ndarray, int]:
+    """One pure-pursuit action tracking ``seg`` in the given gear (+1/-1).
+
+    Mirrors tracker.py: find the closest waypoint (monotonically advancing
+    ``wp_idx``), then walk ``lookahead`` metres of arc length ahead to pick
+    the target. Short lookahead avoids cutting inside min-radius arcs.
+    """
+    cc = env.cc
+    cx, cy, ct = env._car.x, env._car.y, env._car.theta
+
+    best_i, best_d = wp_idx, float("inf")
+    for i in range(wp_idx, min(len(seg), wp_idx + 40)):
+        d = (seg[i].x - cx) ** 2 + (seg[i].y - cy) ** 2
+        if d < best_d:
+            best_d, best_i = d, i
+    wp_idx = best_i
+
+    target_i = wp_idx
+    accum = 0.0
+    while target_i < len(seg) - 1 and accum < lookahead:
+        a, b = seg[target_i], seg[target_i + 1]
+        accum += math.hypot(b.x - a.x, b.y - a.y)
+        target_i += 1
+    target = seg[target_i]
+
+    dx, dy = target.x - cx, target.y - cy
+    cos_t, sin_t = math.cos(ct), math.sin(ct)
+    lx = cos_t * dx + sin_t * dy
+    ly = -sin_t * dx + cos_t * dy
+    if gear < 0:
+        # Reversing: a virtual car at heading theta+pi driving forward traces
+        # the same path with steering -delta. Mirror the target into the
+        # virtual frame, run pure pursuit there, then negate the steering.
+        lx, ly = -lx, -ly
+
+    d2 = lx * lx + ly * ly
+    steer_angle = math.atan(2.0 * ly / d2 * cc.wheelbase) if d2 > 1e-6 else 0.0
+    if gear < 0:
+        steer_angle = -steer_angle
+    steer_cmd = float(np.clip(steer_angle / cc.max_steer, -1.0, 1.0))
+
+    end = seg[-1]
+    remaining = math.hypot(end.x - cx, end.y - cy)
+    max_ms = 1.0 if gear > 0 else 0.6
+    speed_ms = min(0.1 + 0.45 * remaining, max_ms)  # slow near segment end
+    speed_cmd = float(np.clip(gear * speed_ms / env.max_speed, -1.0, 1.0))
+    return np.array([steer_cmd, speed_cmd], dtype=np.float32), wp_idx
+
+
 def collect_demonstrations(
     pc: ParkingConfig, cc: CarConfig,
-    n_demos: int = 50,
-    perturb_pos: float = 1.0,
-    perturb_heading: float = 0.26,  # ~15 deg
+    n_demos: int = 30,
+    perturb_pos: float = 0.5,
+    perturb_heading: float = 0.14,  # ~8 deg
 ) -> List[Dict[str, Any]]:
-    """Run hybrid A* from perturbed starts and replay through the env to get
-    (obs, action, reward, next_obs, done) transitions.
+    """Track the hybrid A* reference path through the env with a gear-aware
+    pure-pursuit controller, recording real (obs, action, reward, next_obs,
+    done) transitions from the fixed start pose (small perturbations).
 
-    The planner produces coarse waypoints; we convert consecutive waypoint pairs
-    into steering+speed actions by inverse-kinematics of the bicycle model, then
-    step the env to get ground-truth observations and rewards.
+    Unlike the previous version this drives each contiguous episode through
+    the env (no per-segment resets) and actually reverses on reverse gears.
     """
-    from trajectory import plan_trajectory
+    from trajectory import _densify_for_tracking
 
-    env = ParkingEnv(parking_config=pc, car_config=cc, max_episode_steps=500)
+    env = ParkingEnv(parking_config=pc, car_config=cc, max_episode_steps=600)
+    if env._ref_path is None:
+        print("  [Demos] No hybrid A* reference path — skipping demo seeding")
+        return []
+
+    ref_wps = [Waypoint(x, y, th) for x, y, th in env._ref_path]
+    ref_wps = _densify_for_tracking(ref_wps, max_step=0.15)
+    segments = split_by_gear(ref_wps)
+
     rng = np.random.default_rng(42)
-    transitions = []
+    transitions: List[Dict[str, Any]] = []
     successes = 0
-
     fx, fy, ftheta = env.lot.car_start_pose
 
     for demo_i in range(n_demos):
-        dx = rng.uniform(-perturb_pos, perturb_pos)
-        dy = rng.uniform(-perturb_pos * 0.5, perturb_pos * 0.5)
-        dtheta = rng.uniform(-perturb_heading, perturb_heading)
-        start = (fx + dx, fy + dy, ftheta + dtheta)
-
-        if not env.grid.pose_is_valid(start):
-            start = env.lot.car_start_pose
-
-        demo_pc = ParkingConfig(
-            parking_type=pc.parking_type,
-            planner="hybrid_astar",
-            lane_width=pc.lane_width,
-            spot_length=pc.spot_length,
-            spot_width=pc.spot_width,
-        )
-        result = plan_trajectory(demo_pc, cc)
-        if not result.feasible or len(result.waypoints) < 3:
-            continue
+        if demo_i == 0:
+            start = (fx, fy, ftheta)
+        else:
+            start = (
+                fx + rng.uniform(-perturb_pos, perturb_pos),
+                fy + rng.uniform(-perturb_pos * 0.5, perturb_pos * 0.5),
+                ftheta + rng.uniform(-perturb_heading, perturb_heading),
+            )
+            if not env.grid.pose_is_valid(start):
+                start = (fx, fy, ftheta)
 
         obs, info = env.reset(options={"start_pose": start})
-        wps = result.waypoints
+        ep_transitions: List[Dict[str, Any]] = []
+        done = False
 
-        for wi in range(len(wps) - 1):
-            curr, nxt = wps[wi], wps[wi + 1]
-            dx_w = nxt.x - curr.x
-            dy_w = nxt.y - curr.y
-            dist = math.hypot(dx_w, dy_w)
-
-            desired_theta = math.atan2(dy_w, dx_w)
-            angle_diff_val = desired_theta - env._car.theta
-            angle_diff_val = (angle_diff_val + math.pi) % (2 * math.pi) - math.pi
-
-            steer_cmd = np.clip(angle_diff_val / cc.max_steer, -1.0, 1.0)
-            speed_cmd = np.clip(dist / (env.dt * env.max_speed), -1.0, 1.0)
-
-            n_substeps = max(1, int(dist / (env.max_speed * env.dt)))
-            for _ in range(n_substeps):
-                action = np.array([steer_cmd, speed_cmd], dtype=np.float32)
+        for seg_i, (gear, seg) in enumerate(segments):
+            if done:
+                break
+            end = seg[-1]
+            wp_idx = 0
+            for _ in range(300):
+                remaining = math.hypot(end.x - env._car.x, end.y - env._car.y)
+                if remaining < 0.12:
+                    break
+                action, wp_idx = _pure_pursuit_step(env, seg, gear, wp_idx)
                 next_obs, reward, terminated, truncated, info = env.step(action)
-                transitions.append({
+                ep_transitions.append({
                     "obs": obs.copy(),
                     "action": action.copy(),
                     "reward": reward,
@@ -119,11 +168,12 @@ def collect_demonstrations(
                 })
                 obs = next_obs
                 if terminated or truncated:
+                    done = True
                     break
-            if terminated or truncated:
-                if info.get("is_success", False):
-                    successes += 1
-                break
+
+        if info.get("is_success", False):
+            successes += 1
+        transitions.extend(ep_transitions)
 
     print(f"  [Demos] Collected {len(transitions)} transitions from "
           f"{n_demos} demos ({successes} successful)")
@@ -144,6 +194,44 @@ def seed_replay_buffer(model, transitions: List[Dict[str, Any]]):
         )
 
 
+def bc_pretrain_actor(
+    model: SAC, transitions: List[Dict[str, Any]],
+    epochs: int = 15, batch_size: int = 512, lr: float = 1e-3,
+):
+    """Behaviour-clone the demo actions into SAC's actor before RL.
+
+    Supervises tanh(mu(latent_pi(obs))) — the deterministic action — with
+    MSE against the demo actions, so RL starts from a policy that can
+    already roughly execute the maneuver instead of discovering it from
+    scratch through Q-learning alone.
+    """
+    actor = model.policy.actor
+    device = model.device
+    obs_t = torch.as_tensor(
+        np.stack([t["obs"] for t in transitions]), dtype=torch.float32, device=device)
+    act_t = torch.as_tensor(
+        np.stack([t["action"] for t in transitions]), dtype=torch.float32, device=device)
+
+    params = list(actor.latent_pi.parameters()) + list(actor.mu.parameters())
+    optimizer = torch.optim.Adam(params, lr=lr)
+    n = len(obs_t)
+
+    for epoch in range(epochs):
+        perm = torch.randperm(n, device=device)
+        total = 0.0
+        for i in range(0, n, batch_size):
+            idx = perm[i:i + batch_size]
+            features = actor.extract_features(obs_t[idx], actor.features_extractor)
+            mean = actor.mu(actor.latent_pi(features))
+            loss = torch.nn.functional.mse_loss(torch.tanh(mean), act_t[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += loss.item() * len(idx)
+        if epoch == 0 or epoch == epochs - 1:
+            print(f"  [BC-init] epoch {epoch + 1}/{epochs}: loss={total / n:.5f}")
+
+
 def _default_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
@@ -152,13 +240,64 @@ def _default_device() -> str:
     return "cpu"
 
 
+class DemoRegCallback(BaseCallback):
+    """SACfD-style demonstration regularization.
+
+    Each env step also takes one small BC gradient step pulling the actor's
+    deterministic action toward the demo actions, with a weight that decays
+    to zero over ``decay_steps``. This stops early Q-learning noise from
+    washing out the demonstrated maneuver while still letting RL own the
+    final policy.
+    """
+
+    def __init__(self, demos: List[Dict[str, Any]], lr: float = 1e-4,
+                 batch_size: int = 256, decay_steps: int = 400_000,
+                 verbose: int = 0):
+        super().__init__(verbose)
+        self._demos = demos
+        self.lr = lr
+        self.batch_size = batch_size
+        self.decay_steps = decay_steps
+        self._obs = None
+
+    def _on_training_start(self) -> None:
+        device = self.model.device
+        self._obs = torch.as_tensor(
+            np.stack([t["obs"] for t in self._demos]),
+            dtype=torch.float32, device=device)
+        self._act = torch.as_tensor(
+            np.stack([t["action"] for t in self._demos]),
+            dtype=torch.float32, device=device)
+        actor = self.model.policy.actor
+        params = list(actor.latent_pi.parameters()) + list(actor.mu.parameters())
+        self._optimizer = torch.optim.Adam(params, lr=self.lr)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps < self.model.learning_starts:
+            return True
+        weight = max(0.0, 1.0 - self.num_timesteps / self.decay_steps)
+        if weight <= 0.0:
+            return True
+        idx = torch.randint(0, len(self._obs), (self.batch_size,),
+                            device=self._obs.device)
+        actor = self.model.policy.actor
+        features = actor.extract_features(self._obs[idx], actor.features_extractor)
+        mean = actor.mu(actor.latent_pi(features))
+        loss = weight * torch.nn.functional.mse_loss(
+            torch.tanh(mean), self._act[idx])
+        self._optimizer.zero_grad()
+        loss.backward()
+        self._optimizer.step()
+        return True
+
+
 class CurriculumCallback(BaseCallback):
     def __init__(self, eval_env: ParkingEnv, check_freq: int = 10000, verbose: int = 1):
         super().__init__(verbose)
         self.eval_env = eval_env
         self.check_freq = check_freq
         self._last_check = 0
-        self._eval_episodes = 50
+        self._eval_episodes = 30
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last_check < self.check_freq:
@@ -205,6 +344,78 @@ class CurriculumCallback(BaseCallback):
         return True
 
 
+class FixedStartEvalCallback(BaseCallback):
+    """Evaluate from the lot's fixed start pose (the `python main.py`
+    scenario) and checkpoint whenever that success rate improves.
+
+    EvalCallback selects by mean reward over the curriculum's random starts,
+    which is not the metric we ship; this one is.
+    """
+
+    def __init__(
+        self, pc: ParkingConfig, cc: CarConfig, save_path: str,
+        eval_freq: int = 10_000, n_episodes: int = 10, verbose: int = 1,
+        env=None,
+    ):
+        super().__init__(verbose)
+        self.env = env if env is not None else ParkingEnv(
+            parking_config=pc, car_config=cc, max_episode_steps=250, seed=123,
+        )
+        self.save_path = save_path
+        self.eval_freq = eval_freq
+        self.n_episodes = n_episodes
+        self._last_eval = 0
+        self.best_rate = -1.0
+        self.best_reward = -np.inf
+        self._rng = np.random.default_rng(7)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last_eval < self.eval_freq:
+            return True
+        self._last_eval = self.num_timesteps
+
+        fx, fy, ftheta = self.env.lot.car_start_pose
+        successes = 0
+        total_reward = 0.0
+        for ep in range(self.n_episodes):
+            if ep == 0:
+                start = (fx, fy, ftheta)
+            else:
+                start = (
+                    fx + self._rng.uniform(-0.5, 0.5),
+                    fy + self._rng.uniform(-0.25, 0.25),
+                    ftheta + self._rng.uniform(-0.14, 0.14),
+                )
+                if not self.env.grid.pose_is_valid(start):
+                    start = (fx, fy, ftheta)
+            obs, info = self.env.reset(options={"start_pose": start})
+            done = False
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = self.env.step(action)
+                total_reward += reward
+                done = terminated or truncated
+            if info.get("is_success", False):
+                successes += 1
+
+        rate = successes / self.n_episodes
+        mean_reward = total_reward / self.n_episodes
+        if self.verbose:
+            print(f"  [FixedStart] t={self.num_timesteps} "
+                  f"success={rate:.0%} mean_reward={mean_reward:.1f}")
+
+        if rate > self.best_rate or (
+            rate == self.best_rate and mean_reward > self.best_reward
+        ):
+            self.best_rate = rate
+            self.best_reward = mean_reward
+            os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+            self.model.save(self.save_path)
+            if self.verbose:
+                print(f"  [FixedStart] new best ({rate:.0%}) → {self.save_path}")
+        return True
+
+
 def _make_envs(
     pc: ParkingConfig, cc: CarConfig, stage: int, seed: int,
     goal_conditioned: bool = False,
@@ -213,21 +424,24 @@ def _make_envs(
         parking_config=pc, car_config=cc,
         curriculum_stage=stage, seed=seed,
         goal_conditioned=goal_conditioned,
+        max_episode_steps=200,
     )
     eval_env = ParkingEnv(
         parking_config=pc, car_config=cc,
         curriculum_stage=stage, seed=seed + 1000,
         goal_conditioned=goal_conditioned,
+        max_episode_steps=250,
     )
     return env, eval_env
 
 
 def _make_callbacks(
     eval_env, algo_name: str, curriculum: bool, verbose: int,
+    pc: Optional[ParkingConfig] = None, cc: Optional[CarConfig] = None,
 ):
     callbacks = []
     if curriculum:
-        callbacks.append(CurriculumCallback(eval_env, check_freq=10000, verbose=verbose))
+        callbacks.append(CurriculumCallback(eval_env, check_freq=15000, verbose=verbose))
 
     save_dir = str(CHECKPOINT_DIR / algo_name / "best")
     os.makedirs(save_dir, exist_ok=True)
@@ -236,11 +450,18 @@ def _make_callbacks(
         Monitor(eval_env),
         best_model_save_path=save_dir,
         log_path=str(LOG_DIR / algo_name / "eval"),
-        eval_freq=10_000,
-        n_eval_episodes=20,
+        eval_freq=20_000,
+        n_eval_episodes=10,
         deterministic=True,
     )
     callbacks.append(eval_cb)
+
+    if pc is not None and cc is not None and not eval_env.goal_conditioned:
+        callbacks.append(FixedStartEvalCallback(
+            pc, cc,
+            save_path=str(CHECKPOINT_DIR / algo_name / "best_fixed" / "model"),
+            eval_freq=15_000, n_episodes=10, verbose=verbose,
+        ))
     return callbacks
 
 
@@ -253,7 +474,8 @@ def train_sac(
     total_timesteps: int = 1_000_000,
     curriculum: bool = True, start_stage: int = 0,
     seed: int = 0, verbose: int = 1, device: str = "auto",
-    demo_seeding: bool = True, n_demos: int = 50,
+    demo_seeding: bool = True, n_demos: int = 60,
+    demo_reg: bool = True,
 ) -> SAC:
     env, eval_env = _make_envs(pc, cc, start_stage, seed)
     env = Monitor(env)
@@ -262,30 +484,37 @@ def train_sac(
         policy="MlpPolicy",
         env=env,
         learning_rate=3e-4,
-        buffer_size=500_000,
-        learning_starts=1_000 if demo_seeding else 5_000,
+        buffer_size=1_000_000,
+        learning_starts=2_000 if demo_seeding else 5_000,
         batch_size=256,
         tau=0.005,
         gamma=0.98,
         train_freq=1,
         gradient_steps=1,
         ent_coef="auto",
-        target_entropy="auto",
+        # Precision parking needs tight actions near the goal: the default
+        # target entropy (-2) keeps sigma~0.37 per action dim, which floods
+        # the buffer with collisions in the tight spot-entry passage.
+        target_entropy=-4.0,
         verbose=verbose,
         seed=seed,
         device=device,
         tensorboard_log=str(LOG_DIR / "sac" / "tensorboard"),
     )
 
+    demos = []
     if demo_seeding:
         print(f"[SAC] Seeding replay buffer with {n_demos} hybrid A* demos...")
         demos = collect_demonstrations(pc, cc, n_demos=n_demos)
         if demos:
             seed_replay_buffer(model, demos)
-            print(f"[SAC] Seeded {len(demos)} transitions — "
-                  f"learning_starts reduced to 1000")
+            print(f"[SAC] Seeded {len(demos)} transitions")
+            bc_pretrain_actor(model, demos)
 
-    callbacks = _make_callbacks(eval_env, "sac", curriculum, verbose)
+    callbacks = _make_callbacks(eval_env, "sac", curriculum, verbose, pc, cc)
+    if demo_reg and demos:
+        callbacks.append(DemoRegCallback(demos, decay_steps=400_000))
+        print("[SAC] Demo regularization enabled (decay over 400k steps)")
 
     save_path = str(CHECKPOINT_DIR / "sac" / "final")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -339,7 +568,7 @@ def train_td3(
         tensorboard_log=str(LOG_DIR / "td3" / "tensorboard"),
     )
 
-    callbacks = _make_callbacks(eval_env, "td3", curriculum, verbose)
+    callbacks = _make_callbacks(eval_env, "td3", curriculum, verbose, pc, cc)
 
     save_path = str(CHECKPOINT_DIR / "td3" / "final")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -386,7 +615,7 @@ def train_ppo(
         tensorboard_log=str(LOG_DIR / "ppo" / "tensorboard"),
     )
 
-    callbacks = _make_callbacks(eval_env, "ppo", curriculum, verbose)
+    callbacks = _make_callbacks(eval_env, "ppo", curriculum, verbose, pc, cc)
 
     save_path = str(CHECKPOINT_DIR / "ppo" / "final")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -439,7 +668,7 @@ def train_sac_her(
         tensorboard_log=str(LOG_DIR / "sac_her" / "tensorboard"),
     )
 
-    callbacks = _make_callbacks(eval_env, "sac_her", curriculum, verbose)
+    callbacks = _make_callbacks(eval_env, "sac_her", curriculum, verbose, pc, cc)
 
     save_path = str(CHECKPOINT_DIR / "sac_her" / "final")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -465,9 +694,15 @@ def evaluate_model(
     max_steps: int = 500,
 ) -> Dict[str, Any]:
     goal_conditioned = (algo_name == "sac_her")
+    # Evaluate at the hardest no-obstacle stage so "random" starts cover the
+    # full maneuver, not just the easy near-goal starts of stage 0.
+    eval_stage = max(
+        i for i, s in enumerate(CURRICULUM_STAGES)
+        if s.obstacle_scenario == "none"
+    )
     env = ParkingEnv(
         parking_config=pc, car_config=cc,
-        curriculum_stage=0,
+        curriculum_stage=eval_stage,
         max_episode_steps=max_steps,
         goal_conditioned=goal_conditioned,
     )

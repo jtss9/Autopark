@@ -46,11 +46,11 @@ class CurriculumStage:
 
 
 CURRICULUM_STAGES = [
-    CurriculumStage("easy", 4.0, math.radians(30), "none", 0.80),
-    CurriculumStage("medium", 8.0, math.radians(90), "none", 0.75),
-    CurriculumStage("hard_clear", 12.0, math.pi, "none", 0.65),
-    CurriculumStage("simple_obs", 8.0, math.pi, "entry_blocker", 0.60),
-    CurriculumStage("hard_obs", 8.0, math.pi, "parked_cars", 0.50),
+    CurriculumStage("close", 4.0, math.radians(45), "none", 0.50),
+    CurriculumStage("medium", 7.0, math.radians(90), "none", 0.40),
+    CurriculumStage("far", 11.0, math.pi, "none", 0.30),
+    CurriculumStage("simple_obs", 11.0, math.pi, "entry_blocker", 0.25),
+    CurriculumStage("hard_obs", 11.0, math.pi, "parked_cars", 0.20),
 ]
 
 
@@ -71,14 +71,14 @@ class ParkingEnv(gym.Env):
         parking_config: Optional[ParkingConfig] = None,
         car_config: Optional[CarConfig] = None,
         curriculum_stage: int = 0,
-        max_episode_steps: int = 300,
+        max_episode_steps: int = 500,
         dt: float = 0.1,
         max_speed: float = 2.0,
         goal_conditioned: bool = False,
         reward_type: str = "dense",
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
-        fixed_start_ratio: float = 0.5,
+        fixed_start_ratio: float = 0.6,
         proximity_margin: float = 0.8,
         proximity_penalty_scale: float = 2.0,
     ):
@@ -292,17 +292,32 @@ class ParkingEnv(gym.Env):
         )
         self._prev_heading_error = abs(angle_diff(self._car.theta, gtheta))
 
+        spot_entry_x = gx
+        spot_entry_y = self.lot.lane_rect.h / 2
+        self._prev_entry_dist = math.hypot(
+            self._car.x - spot_entry_x, self._car.y - spot_entry_y
+        )
+
         return self._make_obs(), self._get_info()
 
     def _sample_start(self, stage: CurriculumStage) -> Pose:
         """Sample a valid start pose within curriculum constraints.
 
-        With probability ``fixed_start_ratio``, returns the lot's default
-        car_start_pose (the fixed position shown in the UI) so the policy
-        learns to drive from the realistic starting position, not just from
-        random poses near the goal.
+        With probability ``fixed_start_ratio``, samples near the lot's
+        default car_start_pose with small perturbations (±1m position,
+        ±15° heading) so the policy learns the realistic approach while
+        staying robust to slight variations.
         """
         if self._rng.random() < self.fixed_start_ratio:
+            fx, fy, ftheta = self.lot.car_start_pose
+            x = fx + self._rng.uniform(-1.0, 1.0)
+            y = fy + self._rng.uniform(-0.5, 0.5)
+            theta = wrap_pi(ftheta + self._rng.uniform(
+                -math.radians(15), math.radians(15)
+            ))
+            pose = (x, y, theta)
+            if self.grid.pose_is_valid(pose):
+                return pose
             return self.lot.car_start_pose
 
         gx, gy, gtheta = self._goal_pose
@@ -435,6 +450,31 @@ class ParkingEnv(gym.Env):
         heading_progress = self._prev_heading_error - heading_error
         reward += 5.0 * pos_progress
         reward += 1.0 * heading_progress
+
+        # Intermediate waypoint: reward getting to the lane position in front
+        # of the spot (x ≈ goal_x, y ≈ lane center). This bridges the 11m gap
+        # by giving signal before the car reaches the final goal.
+        spot_entry_x = gx
+        spot_entry_y = self.lot.lane_rect.h / 2  # lane center
+        dist_to_entry = math.hypot(pose[0] - spot_entry_x, pose[1] - spot_entry_y)
+        if not hasattr(self, '_prev_entry_dist'):
+            self._prev_entry_dist = dist_to_entry
+        entry_progress = self._prev_entry_dist - dist_to_entry
+        reward += 2.0 * entry_progress
+        self._prev_entry_dist = dist_to_entry
+
+        # Phase-aware rewards: detect which phase the car is in
+        # Phase 1: approaching spot entrance (far from goal, in lane)
+        # Phase 2: at spot entrance, aligning (near spot x, in lane)
+        # Phase 3: reversing into spot (y > lane top)
+        spot_entry_x = self._goal_pose[0]
+        at_spot_x = abs(pose[0] - spot_entry_x) < 2.0
+        in_lane = pose[1] < self.lot.lane_rect.top
+        heading_toward_spot = abs(angle_diff(pose[2], self._goal_pose[2])) < math.radians(45)
+
+        if at_spot_x and heading_toward_spot and not in_lane:
+            # Phase 3: reversing into spot — strong reward for y-progress
+            reward += 3.0 * max(0, pose[1] - self.lot.lane_rect.top) / self.lot.spot_rect.h
 
         # Near-goal heading bonus
         if pos_error < 1.0:

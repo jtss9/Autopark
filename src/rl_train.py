@@ -44,6 +44,106 @@ LOG_DIR = Path(__file__).parent.parent / "logs"
 ALGO_REGISTRY = {}
 
 
+# ---------------------------------------------------------------------------
+# Demonstration seeding: replay expert trajectories into the replay buffer
+# ---------------------------------------------------------------------------
+
+def collect_demonstrations(
+    pc: ParkingConfig, cc: CarConfig,
+    n_demos: int = 50,
+    perturb_pos: float = 1.0,
+    perturb_heading: float = 0.26,  # ~15 deg
+) -> List[Dict[str, Any]]:
+    """Run hybrid A* from perturbed starts and replay through the env to get
+    (obs, action, reward, next_obs, done) transitions.
+
+    The planner produces coarse waypoints; we convert consecutive waypoint pairs
+    into steering+speed actions by inverse-kinematics of the bicycle model, then
+    step the env to get ground-truth observations and rewards.
+    """
+    from trajectory import plan_trajectory
+
+    env = ParkingEnv(parking_config=pc, car_config=cc, max_episode_steps=500)
+    rng = np.random.default_rng(42)
+    transitions = []
+    successes = 0
+
+    fx, fy, ftheta = env.lot.car_start_pose
+
+    for demo_i in range(n_demos):
+        dx = rng.uniform(-perturb_pos, perturb_pos)
+        dy = rng.uniform(-perturb_pos * 0.5, perturb_pos * 0.5)
+        dtheta = rng.uniform(-perturb_heading, perturb_heading)
+        start = (fx + dx, fy + dy, ftheta + dtheta)
+
+        if not env.grid.pose_is_valid(start):
+            start = env.lot.car_start_pose
+
+        demo_pc = ParkingConfig(
+            parking_type=pc.parking_type,
+            planner="hybrid_astar",
+            lane_width=pc.lane_width,
+            spot_length=pc.spot_length,
+            spot_width=pc.spot_width,
+        )
+        result = plan_trajectory(demo_pc, cc)
+        if not result.feasible or len(result.waypoints) < 3:
+            continue
+
+        obs, info = env.reset(options={"start_pose": start})
+        wps = result.waypoints
+
+        for wi in range(len(wps) - 1):
+            curr, nxt = wps[wi], wps[wi + 1]
+            dx_w = nxt.x - curr.x
+            dy_w = nxt.y - curr.y
+            dist = math.hypot(dx_w, dy_w)
+
+            desired_theta = math.atan2(dy_w, dx_w)
+            angle_diff_val = desired_theta - env._car.theta
+            angle_diff_val = (angle_diff_val + math.pi) % (2 * math.pi) - math.pi
+
+            steer_cmd = np.clip(angle_diff_val / cc.max_steer, -1.0, 1.0)
+            speed_cmd = np.clip(dist / (env.dt * env.max_speed), -1.0, 1.0)
+
+            n_substeps = max(1, int(dist / (env.max_speed * env.dt)))
+            for _ in range(n_substeps):
+                action = np.array([steer_cmd, speed_cmd], dtype=np.float32)
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                transitions.append({
+                    "obs": obs.copy(),
+                    "action": action.copy(),
+                    "reward": reward,
+                    "next_obs": next_obs.copy(),
+                    "done": terminated,
+                })
+                obs = next_obs
+                if terminated or truncated:
+                    break
+            if terminated or truncated:
+                if info.get("is_success", False):
+                    successes += 1
+                break
+
+    print(f"  [Demos] Collected {len(transitions)} transitions from "
+          f"{n_demos} demos ({successes} successful)")
+    return transitions
+
+
+def seed_replay_buffer(model, transitions: List[Dict[str, Any]]):
+    """Insert demonstration transitions into the model's replay buffer."""
+    buf = model.replay_buffer
+    for t in transitions:
+        buf.add(
+            obs=t["obs"].reshape(1, -1),
+            next_obs=t["next_obs"].reshape(1, -1),
+            action=t["action"].reshape(1, -1),
+            reward=np.array([t["reward"]]),
+            done=np.array([t["done"]]),
+            infos=[{}],
+        )
+
+
 def _default_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
@@ -153,6 +253,7 @@ def train_sac(
     total_timesteps: int = 1_000_000,
     curriculum: bool = True, start_stage: int = 0,
     seed: int = 0, verbose: int = 1, device: str = "auto",
+    demo_seeding: bool = True, n_demos: int = 50,
 ) -> SAC:
     env, eval_env = _make_envs(pc, cc, start_stage, seed)
     env = Monitor(env)
@@ -162,7 +263,7 @@ def train_sac(
         env=env,
         learning_rate=3e-4,
         buffer_size=500_000,
-        learning_starts=5_000,
+        learning_starts=1_000 if demo_seeding else 5_000,
         batch_size=256,
         tau=0.005,
         gamma=0.98,
@@ -175,6 +276,14 @@ def train_sac(
         device=device,
         tensorboard_log=str(LOG_DIR / "sac" / "tensorboard"),
     )
+
+    if demo_seeding:
+        print(f"[SAC] Seeding replay buffer with {n_demos} hybrid A* demos...")
+        demos = collect_demonstrations(pc, cc, n_demos=n_demos)
+        if demos:
+            seed_replay_buffer(model, demos)
+            print(f"[SAC] Seeded {len(demos)} transitions — "
+                  f"learning_starts reduced to 1000")
 
     callbacks = _make_callbacks(eval_env, "sac", curriculum, verbose)
 
@@ -353,7 +462,7 @@ def evaluate_model(
     model, algo_name: str,
     pc: ParkingConfig, cc: CarConfig,
     n_episodes: int = 50,
-    max_steps: int = 300,
+    max_steps: int = 500,
 ) -> Dict[str, Any]:
     goal_conditioned = (algo_name == "sac_her")
     env = ParkingEnv(

@@ -197,7 +197,7 @@ def rollout_sac(
     model: SAC,
     pc: Optional[ParkingConfig] = None,
     cc: Optional[CarConfig] = None,
-    max_steps: int = 300,
+    max_steps: int = 500,
     deterministic: bool = True,
     curriculum_stage: int = 0,
     use_lot_start: bool = False,

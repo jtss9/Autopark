@@ -90,7 +90,7 @@ All world geometry uses **+x right, +y up** (metres), θ in radians. Both tkinte
 | perpendicular (otherwise) | `_plan_perpendicular_mpc` (single-step) |
 | parallel | `_plan_parallel_mpc` |
 
-The user-placed obstacle (`pc.obstacle`) is consumed only by `plan_hybrid_astar`, which is also the only planner exposed with the obstacle checkbox, so the MPC planners never see an obstacle they cannot reason about.
+The user-placed obstacle (`pc.obstacle`) is consumed by `plan_hybrid_astar` and by the SAC planner (`rl_sac.plan_sac` → `ParkingEnv`, whose observation carries nearest-obstacle features); these are also the only planners exposed with the obstacle checkbox, so the MPC planners never see an obstacle they cannot reason about.
 
 When `track=True` and the plan is feasible, `_attach_tracker` densifies the path and runs `tracker.track_path`, populating `result.executed_waypoints` and `result.tracking_metrics` (mean/max CTE, final pose error, fully-in-spot, cusps).
 

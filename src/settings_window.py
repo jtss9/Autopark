@@ -36,11 +36,14 @@ COLOR_CAR       = "#376ec8"   # canvas car body          (55,110,200)
 COLOR_CAR_FRONT = "#96bcff"   # canvas car front edge    (150,188,255)
 
 # (display label, var attribute name, slider min, slider max, default)
+# Defaults match config.py (the scene the RL models are strongest on:
+# 100% fixed-start success for both parking types); the lane slider must
+# reach 6.0 m or that scene is unreachable from the UI.
 SLIDER_DEFS = [
-    ("Lane Width (m)",  "var_lane_w",   3.5, 5.5,  4.4),
-    ("Spot Length (m)", "var_spot_len", 5.0, 6.0,  5.5),
+    ("Lane Width (m)",  "var_lane_w",   3.5, 6.0,  6.0),
+    ("Spot Length (m)", "var_spot_len", 5.0, 6.0,  6.0),
     ("Spot Width (m)",  "var_spot_w",   2.0, 3.0,  2.5),
-    ("Car Length (m)",  "var_car_len",  3.5, 5.0,  4.2),
+    ("Car Length (m)",  "var_car_len",  3.5, 5.0,  4.5),
     ("Car Width (m)",   "var_car_w",    1.6, 2.2,  1.8),
 ]
 
@@ -238,17 +241,19 @@ class SettingsWindow:
         self._update_preview()
 
     # ------------------------------------------------------------------
-    # Obstacle placement (Hybrid A* only)
+    # Obstacle placement (planners that consume the user obstacle)
     # ------------------------------------------------------------------
+    OBSTACLE_PLANNERS = ("hybrid_astar", "sac")
+
     def _obstacle_enabled(self) -> bool:
-        return (self.var_planner.get() == "hybrid_astar"
+        return (self.var_planner.get() in self.OBSTACLE_PLANNERS
                 and self.var_show_obstacle.get())
 
     def _sync_obstacle_controls(self):
-        """Show the obstacle checkbox only for the Hybrid A* planner."""
+        """Show the obstacle checkbox only for planners that handle it."""
         if not hasattr(self, "obstacle_check"):
             return
-        if self.var_planner.get() == "hybrid_astar":
+        if self.var_planner.get() in self.OBSTACLE_PLANNERS:
             self.obstacle_check.grid()
         else:
             self.obstacle_check.grid_remove()

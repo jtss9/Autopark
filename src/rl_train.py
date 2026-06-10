@@ -53,7 +53,7 @@ ALGO_REGISTRY = {}
 # ---------------------------------------------------------------------------
 
 def _pure_pursuit_step(env: ParkingEnv, seg: List[Waypoint], gear: int,
-                       wp_idx: int, lookahead: float = 0.6,
+                       wp_idx: int, lookahead: float = 0.45,
                        ) -> Tuple[np.ndarray, int]:
     """One pure-pursuit action tracking ``seg`` in the given gear (+1/-1).
 
@@ -97,8 +97,10 @@ def _pure_pursuit_step(env: ParkingEnv, seg: List[Waypoint], gear: int,
 
     end = seg[-1]
     remaining = math.hypot(end.x - cx, end.y - cy)
-    max_ms = 1.0 if gear > 0 else 0.6
-    speed_ms = min(0.1 + 0.45 * remaining, max_ms)  # slow near segment end
+    # Slow: tracking error grows with per-step displacement (dt=0.2), and
+    # tight scene variants leave only ~10 cm of slack around the reference.
+    max_ms = 0.55 if gear > 0 else 0.35
+    speed_ms = min(0.08 + 0.35 * remaining, max_ms)  # slow near segment end
     speed_cmd = float(np.clip(gear * speed_ms / env.max_speed, -1.0, 1.0))
     return np.array([steer_cmd, speed_cmd], dtype=np.float32), wp_idx
 
@@ -108,75 +110,102 @@ def collect_demonstrations(
     n_demos: int = 30,
     perturb_pos: float = 0.5,
     perturb_heading: float = 0.14,  # ~8 deg
+    worlds: Optional[List[Tuple[Any, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Track the hybrid A* reference path through the env with a gear-aware
     pure-pursuit controller, recording real (obs, action, reward, next_obs,
     done) transitions from the fixed start pose (small perturbations).
 
-    Unlike the previous version this drives each contiguous episode through
-    the env (no per-segment resets) and actually reverses on reverse gears.
+    ``worlds`` is a list of (scene, obstacle) tuples (None = base world);
+    demos are split across them so the buffer covers scene/obstacle
+    variants, not just the default lot.
     """
     from trajectory import _densify_for_tracking
 
     env = ParkingEnv(parking_config=pc, car_config=cc, max_episode_steps=600)
-    if env._ref_path is None:
-        print("  [Demos] No hybrid A* reference path — skipping demo seeding")
-        return []
-
-    ref_wps = [Waypoint(x, y, th) for x, y, th in env._ref_path]
-    ref_wps = _densify_for_tracking(ref_wps, max_step=0.15)
-    segments = split_by_gear(ref_wps)
+    worlds = worlds or [(None, None)]
+    per_world = max(1, n_demos // len(worlds))
 
     rng = np.random.default_rng(42)
     transitions: List[Dict[str, Any]] = []
     successes = 0
-    fx, fy, ftheta = env.lot.car_start_pose
+    episodes = 0
 
-    for demo_i in range(n_demos):
-        if demo_i == 0:
-            start = (fx, fy, ftheta)
-        else:
-            start = (
-                fx + rng.uniform(-perturb_pos, perturb_pos),
-                fy + rng.uniform(-perturb_pos * 0.5, perturb_pos * 0.5),
-                ftheta + rng.uniform(-perturb_heading, perturb_heading),
-            )
-            if not env.grid.pose_is_valid(start):
+    for scene, obstacle in worlds:
+        if not env.set_world(scene, obstacle):
+            print(f"  [Demos] skipping infeasible world {scene} obs={obstacle}")
+            continue
+
+        ref_wps = [Waypoint(x, y, th) for x, y, th in env._ref_path]
+        ref_wps = _densify_for_tracking(ref_wps, max_step=0.15)
+        segments = split_by_gear(ref_wps)
+        # The tracker stops near each segment's endpoint; per-segment stop
+        # targets are the TRUE endpoints (before any extension below).
+        seg_targets = [seg[-1] for _, seg in segments]
+        # Extend the final segment ~1 m beyond the goal along its heading:
+        # pure pursuit cannot finish straightening on a short last segment
+        # and otherwise arrives tilted (a 5 deg tilt pokes a corner out of
+        # the spot and the success check never fires). The env terminates
+        # on success, so the extension is never actually driven to its end.
+        last_gear, last_seg = segments[-1]
+        ex_, ey_, eth_ = last_seg[-1].x, last_seg[-1].y, last_seg[-1].theta
+        direction = 1 if last_gear > 0 else -1
+        for k in range(1, 8):
+            d = 0.15 * k * direction
+            last_seg.append(Waypoint(
+                ex_ + d * math.cos(eth_), ey_ + d * math.sin(eth_), eth_))
+        fx, fy, ftheta = env.lot.car_start_pose
+
+        for demo_i in range(per_world):
+            if demo_i == 0:
                 start = (fx, fy, ftheta)
+            else:
+                start = (
+                    fx + rng.uniform(-perturb_pos, perturb_pos),
+                    fy + rng.uniform(-perturb_pos * 0.5, perturb_pos * 0.5),
+                    ftheta + rng.uniform(-perturb_heading, perturb_heading),
+                )
+                if not env.grid.pose_is_valid(start):
+                    start = (fx, fy, ftheta)
 
-        obs, info = env.reset(options={"start_pose": start})
-        ep_transitions: List[Dict[str, Any]] = []
-        done = False
+            obs, info = env.reset(options={"start_pose": start})
+            ep_transitions: List[Dict[str, Any]] = []
+            done = False
 
-        for seg_i, (gear, seg) in enumerate(segments):
-            if done:
-                break
-            end = seg[-1]
-            wp_idx = 0
-            for _ in range(300):
-                remaining = math.hypot(end.x - env._car.x, end.y - env._car.y)
-                if remaining < 0.12:
+            for seg_i, (gear, seg) in enumerate(segments):
+                if done:
                     break
-                action, wp_idx = _pure_pursuit_step(env, seg, gear, wp_idx)
-                next_obs, reward, terminated, truncated, info = env.step(action)
-                ep_transitions.append({
-                    "obs": obs.copy(),
-                    "action": action.copy(),
-                    "reward": reward,
-                    "next_obs": next_obs.copy(),
-                    "done": terminated,
-                })
-                obs = next_obs
-                if terminated or truncated:
-                    done = True
-                    break
+                end = seg_targets[seg_i]
+                wp_idx = 0
+                for _ in range(600):
+                    remaining = math.hypot(end.x - env._car.x, end.y - env._car.y)
+                    if remaining < 0.12:
+                        break
+                    action, wp_idx = _pure_pursuit_step(env, seg, gear, wp_idx)
+                    next_obs, reward, terminated, truncated, info = env.step(action)
+                    ep_transitions.append({
+                        "obs": obs.copy(),
+                        "action": action.copy(),
+                        "reward": reward,
+                        "next_obs": next_obs.copy(),
+                        "done": terminated,
+                    })
+                    obs = next_obs
+                    if terminated or truncated:
+                        done = True
+                        break
 
-        if info.get("is_success", False):
-            successes += 1
-        transitions.extend(ep_transitions)
+            episodes += 1
+            # Quality gate: only successful episodes are worth imitating —
+            # seeding failed pure-pursuit episodes biases the buffer toward
+            # a controller's failure modes in worlds it cannot track.
+            if info.get("is_success", False):
+                successes += 1
+                transitions.extend(ep_transitions)
 
     print(f"  [Demos] Collected {len(transitions)} transitions from "
-          f"{n_demos} demos ({successes} successful)")
+          f"{successes}/{episodes} successful demos across "
+          f"{len(worlds)} worlds")
     return transitions
 
 
@@ -238,6 +267,45 @@ def _default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def _prefill_base_experience(
+    model: "SAC", pc: ParkingConfig, cc: CarConfig, n_steps: int = 30_000,
+):
+    """Fill the replay buffer with the warm-started policy's own base-world
+    experience before fine-tuning starts.
+
+    A from-scratch run reaching the randomization stage replays hundreds of
+    thousands of base-world transitions from its buffer, which anchors the
+    critic; a warm start begins with an empty buffer, so the first
+    out-of-distribution scenes swamp the critic and the base skill is
+    forgotten within ~15k steps. This prefill restores that anchor.
+    """
+    env = ParkingEnv(
+        parking_config=pc, car_config=cc,
+        max_episode_steps=350, curriculum_stage=2, seed=99,
+    )
+    obs, _ = env.reset()
+    successes = 0
+    episodes = 0
+    for _ in range(n_steps):
+        action, _ = model.predict(obs, deterministic=False)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        model.replay_buffer.add(
+            obs=obs.reshape(1, -1),
+            next_obs=next_obs.reshape(1, -1),
+            action=np.asarray(action).reshape(1, -1),
+            reward=np.array([reward]),
+            done=np.array([terminated]),
+            infos=[{}],
+        )
+        obs = next_obs
+        if terminated or truncated:
+            episodes += 1
+            successes += bool(info.get("is_success", False))
+            obs, _ = env.reset()
+    print(f"  [Prefill] {n_steps} base-world transitions "
+          f"({successes}/{episodes} episodes successful)")
 
 
 class DemoRegCallback(BaseCallback):
@@ -355,16 +423,22 @@ class FixedStartEvalCallback(BaseCallback):
     def __init__(
         self, pc: ParkingConfig, cc: CarConfig, save_path: str,
         eval_freq: int = 10_000, n_episodes: int = 10, verbose: int = 1,
-        env=None,
+        env=None, eval_worlds: Optional[List[Tuple[Any, Any]]] = None,
     ):
         super().__init__(verbose)
         self.env = env if env is not None else ParkingEnv(
-            parking_config=pc, car_config=cc, max_episode_steps=250, seed=123,
+            parking_config=pc, car_config=cc, max_episode_steps=450, seed=123,
         )
         self.save_path = save_path
         self.eval_freq = eval_freq
         self.n_episodes = n_episodes
-        self._last_eval = 0
+        # (scene, obstacle) variants to evaluate; None = base world.
+        self.eval_worlds = eval_worlds or [(None, None)]
+        # Evaluate immediately at the first step too: for residual/warm-start
+        # models the initial policy is already good (zero-init residual ==
+        # base controller), and checkpointing it before any training drift
+        # guarantees the deployed model is at least as good as the start.
+        self._last_eval = -self.eval_freq
         self.best_rate = -1.0
         self.best_reward = -np.inf
         self._rng = np.random.default_rng(7)
@@ -374,32 +448,37 @@ class FixedStartEvalCallback(BaseCallback):
             return True
         self._last_eval = self.num_timesteps
 
-        fx, fy, ftheta = self.env.lot.car_start_pose
         successes = 0
+        episodes = 0
         total_reward = 0.0
-        for ep in range(self.n_episodes):
-            if ep == 0:
-                start = (fx, fy, ftheta)
-            else:
-                start = (
-                    fx + self._rng.uniform(-0.5, 0.5),
-                    fy + self._rng.uniform(-0.25, 0.25),
-                    ftheta + self._rng.uniform(-0.14, 0.14),
-                )
-                if not self.env.grid.pose_is_valid(start):
+        for scene, obstacle in self.eval_worlds:
+            if not self.env.set_world(scene, obstacle):
+                continue
+            fx, fy, ftheta = self.env.lot.car_start_pose
+            for ep in range(self.n_episodes):
+                if ep == 0:
                     start = (fx, fy, ftheta)
-            obs, info = self.env.reset(options={"start_pose": start})
-            done = False
-            while not done:
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = self.env.step(action)
-                total_reward += reward
-                done = terminated or truncated
-            if info.get("is_success", False):
-                successes += 1
+                else:
+                    start = (
+                        fx + self._rng.uniform(-0.5, 0.5),
+                        fy + self._rng.uniform(-0.25, 0.25),
+                        ftheta + self._rng.uniform(-0.14, 0.14),
+                    )
+                    if not self.env.grid.pose_is_valid(start):
+                        start = (fx, fy, ftheta)
+                obs, info = self.env.reset(options={"start_pose": start})
+                done = False
+                while not done:
+                    action, _ = self.model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = self.env.step(action)
+                    total_reward += reward
+                    done = terminated or truncated
+                episodes += 1
+                if info.get("is_success", False):
+                    successes += 1
 
-        rate = successes / self.n_episodes
-        mean_reward = total_reward / self.n_episodes
+        rate = successes / max(episodes, 1)
+        mean_reward = total_reward / max(episodes, 1)
         if self.verbose:
             print(f"  [FixedStart] t={self.num_timesteps} "
                   f"success={rate:.0%} mean_reward={mean_reward:.1f}")
@@ -424,13 +503,13 @@ def _make_envs(
         parking_config=pc, car_config=cc,
         curriculum_stage=stage, seed=seed,
         goal_conditioned=goal_conditioned,
-        max_episode_steps=200,
+        max_episode_steps=350,
     )
     eval_env = ParkingEnv(
         parking_config=pc, car_config=cc,
         curriculum_stage=stage, seed=seed + 1000,
         goal_conditioned=goal_conditioned,
-        max_episode_steps=250,
+        max_episode_steps=450,
     )
     return env, eval_env
 
@@ -438,6 +517,7 @@ def _make_envs(
 def _make_callbacks(
     eval_env, algo_name: str, curriculum: bool, verbose: int,
     pc: Optional[ParkingConfig] = None, cc: Optional[CarConfig] = None,
+    eval_worlds: Optional[List[Tuple[Any, Any]]] = None,
 ):
     callbacks = []
     if curriculum:
@@ -457,10 +537,12 @@ def _make_callbacks(
     callbacks.append(eval_cb)
 
     if pc is not None and cc is not None and not eval_env.goal_conditioned:
+        n_eps = 10 if not eval_worlds or len(eval_worlds) <= 1 else 4
         callbacks.append(FixedStartEvalCallback(
             pc, cc,
             save_path=str(CHECKPOINT_DIR / algo_name / "best_fixed" / "model"),
-            eval_freq=15_000, n_episodes=10, verbose=verbose,
+            eval_freq=25_000, n_episodes=n_eps, verbose=verbose,
+            eval_worlds=eval_worlds,
         ))
     return callbacks
 
@@ -469,6 +551,34 @@ def _make_callbacks(
 # SAC
 # ---------------------------------------------------------------------------
 
+def _demo_and_eval_worlds(pc: ParkingConfig, cc: Optional[CarConfig] = None):
+    """World variants for demo collection and fixed-start evaluation.
+
+    Worlds are feasibility-filtered up front (cheap — reference paths are
+    disk-cached), so the checkpoint-selection metric covers a representative
+    spread of the training pool instead of accidentally scoring only worlds
+    the policy cannot solve (or missing ones it regresses on).
+    """
+    from rl_env import ParkingEnv, scene_pool, obstacle_candidates
+    cc = cc or CarConfig()
+    probe = ParkingEnv(parking_config=pc, car_config=cc)
+    pool = scene_pool(pc.parking_type)
+
+    feasible_scenes = [s for s in pool if probe.set_world(s, None)][:6]
+    feasible_obs = []
+    for s in feasible_scenes[:3]:
+        for ob in obstacle_candidates(pc.parking_type, s):
+            if probe.set_world(s, ob):
+                feasible_obs.append((s, ob))
+                break
+
+    demo_worlds = [(None, None)] + [(s, None) for s in feasible_scenes[:3]] \
+        + feasible_obs[:2]
+    eval_worlds = [(None, None)] + [(s, None) for s in feasible_scenes[:4]] \
+        + feasible_obs[:1]
+    return demo_worlds, eval_worlds
+
+
 def train_sac(
     pc: ParkingConfig, cc: CarConfig,
     total_timesteps: int = 1_000_000,
@@ -476,51 +586,84 @@ def train_sac(
     seed: int = 0, verbose: int = 1, device: str = "auto",
     demo_seeding: bool = True, n_demos: int = 60,
     demo_reg: bool = True,
+    warm_start: Optional[str] = None,
 ) -> SAC:
+    # Separate checkpoint/log namespaces per parking type so both models
+    # can coexist ("sac" kept for perpendicular for backward compat).
+    algo_dir = "sac" if pc.parking_type == "perpendicular" else "sac_parallel"
+
     env, eval_env = _make_envs(pc, cc, start_stage, seed)
     env = Monitor(env)
 
-    model = SAC(
-        policy="MlpPolicy",
-        env=env,
-        learning_rate=3e-4,
-        buffer_size=1_000_000,
-        learning_starts=2_000 if demo_seeding else 5_000,
-        batch_size=256,
-        tau=0.005,
-        gamma=0.98,
-        train_freq=1,
-        gradient_steps=1,
-        ent_coef="auto",
-        # Precision parking needs tight actions near the goal: the default
-        # target entropy (-2) keeps sigma~0.37 per action dim, which floods
-        # the buffer with collisions in the tight spot-entry passage.
-        target_entropy=-4.0,
-        verbose=verbose,
-        seed=seed,
-        device=device,
-        tensorboard_log=str(LOG_DIR / "sac" / "tensorboard"),
-    )
+    if warm_start:
+        print(f"[SAC] Warm-starting from {warm_start}")
+        model = SAC.load(
+            warm_start, env=env, device=device,
+            tensorboard_log=str(LOG_DIR / algo_dir / "tensorboard"),
+        )
+        # Keep the loaded step counters (no reset): the policy acts from
+        # step one instead of a uniform-random warmup phase. Forgetting is
+        # prevented by the base-experience prefill + rehearsal (a timid
+        # 1e-4 lr only slowed variant learning and still drifted skills).
+        model.learning_starts = 0
+    else:
+        model = SAC(
+            policy="MlpPolicy",
+            env=env,
+            learning_rate=3e-4,
+            buffer_size=1_000_000,
+            learning_starts=2_000 if demo_seeding else 5_000,
+            batch_size=256,
+            tau=0.005,
+            gamma=0.98,
+            train_freq=1,
+            gradient_steps=1,
+            # FIXED entropy coefficient. Auto-tuning exploded twice on the
+            # parallel task (alpha -> 3e+31 -> NaN actor): while the task is
+            # unsolved, collisions push sigma down, entropy sits below any
+            # target, and the auto-alpha grows without bound. 0.05 is inside
+            # the healthy range the successful perpendicular run settled at
+            # (0.04-0.13).
+            ent_coef=0.05,
+            verbose=verbose,
+            seed=seed,
+            device=device,
+            tensorboard_log=str(LOG_DIR / algo_dir / "tensorboard"),
+        )
+
+    demo_worlds, eval_worlds = _demo_and_eval_worlds(pc, cc)
 
     demos = []
     if demo_seeding:
         print(f"[SAC] Seeding replay buffer with {n_demos} hybrid A* demos...")
-        demos = collect_demonstrations(pc, cc, n_demos=n_demos)
+        demos = collect_demonstrations(pc, cc, n_demos=n_demos, worlds=demo_worlds)
         if demos:
             seed_replay_buffer(model, demos)
             print(f"[SAC] Seeded {len(demos)} transitions")
-            bc_pretrain_actor(model, demos)
+            if not warm_start:
+                # Don't overwrite an already-trained actor with BC.
+                bc_pretrain_actor(model, demos)
 
-    callbacks = _make_callbacks(eval_env, "sac", curriculum, verbose, pc, cc)
-    if demo_reg and demos:
+    if warm_start:
+        _prefill_base_experience(model, pc, cc, n_steps=30_000)
+
+    callbacks = _make_callbacks(
+        eval_env, algo_dir, curriculum, verbose, pc, cc, eval_worlds=eval_worlds,
+    )
+    if demo_reg and demos and not warm_start:
         callbacks.append(DemoRegCallback(demos, decay_steps=400_000))
         print("[SAC] Demo regularization enabled (decay over 400k steps)")
 
-    save_path = str(CHECKPOINT_DIR / "sac" / "final")
+    save_path = str(CHECKPOINT_DIR / algo_dir / "final")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    print(f"[SAC] Training for {total_timesteps} steps on {device}...")
-    model.learn(total_timesteps=total_timesteps, callback=callbacks)
+    print(f"[SAC] Training {pc.parking_type} for {total_timesteps} steps "
+          f"on {device} (start stage {start_stage})...")
+    # Warm starts keep the checkpoint's step counters (SB3 then ADDS
+    # total_timesteps on top), so the policy acts immediately and the
+    # callbacks see monotonically increasing timesteps.
+    model.learn(total_timesteps=total_timesteps, callback=callbacks,
+                reset_num_timesteps=not warm_start)
     model.save(save_path)
     print(f"[SAC] Saved to {save_path}")
     return model
@@ -729,6 +872,9 @@ def evaluate_model(
     for ep in range(n_episodes):
         use_fixed = (ep % 2 == 0)
         if use_fixed:
+            # Fixed-start episodes always measure the base world (random
+            # episodes may have left the env on a randomized scene).
+            env.set_world()
             obs, info = env.reset(options={"start_pose": env.lot.car_start_pose})
             results["from_fixed_start"]["total"] += 1
         else:
@@ -817,6 +963,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval-episodes", type=int, default=50)
     parser.add_argument("--eval-only", action="store_true",
                         help="Skip training, only evaluate existing checkpoints")
+    parser.add_argument("--warm-start", type=str, default=None,
+                        help="Path to a SAC checkpoint to continue training from")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -848,6 +996,9 @@ if __name__ == "__main__":
             model = algo_cls.load(ckpt, device=args.device)
         else:
             t0 = time.perf_counter()
+            extra = {}
+            if algo_name == "sac" and args.warm_start:
+                extra["warm_start"] = args.warm_start
             model = train_fn(
                 pc=pc, cc=cc,
                 total_timesteps=args.timesteps,
@@ -855,6 +1006,7 @@ if __name__ == "__main__":
                 start_stage=args.stage,
                 seed=args.seed,
                 device=args.device,
+                **extra,
             )
             elapsed = time.perf_counter() - t0
             print(f"  Training time: {elapsed:.0f}s")

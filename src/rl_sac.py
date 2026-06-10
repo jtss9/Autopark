@@ -298,16 +298,23 @@ def plan_sac(
     if device == "auto":
         device = _default_device()
 
+    # Checkpoints are per parking type ("sac" = perpendicular for backward
+    # compatibility, "sac_parallel" = parallel).
+    type_dir = "sac" if pc.parking_type == "perpendicular" else "sac_parallel"
+
     # Deployment preference (head-to-head, 100 episodes, 2026-06-10):
     # pure SAC best_fixed 94% overall / 100% fixed / 0 collisions beats
     # residual SAC (82%/100%) and the pure-pursuit base (87%/100%), so plain
-    # SAC checkpoints are tried first and residual SAC is the fallback.
+    # SAC checkpoints are tried first and residual SAC (base controller +
+    # learned correction, also per parking type) is the fallback.
+    residual_dir = ("residual" if pc.parking_type == "perpendicular"
+                    else "residual_parallel")
     if model_path is None and not os.path.exists(
-        str(CHECKPOINT_DIR / "sac" / "best_fixed" / "model.zip")
+        str(CHECKPOINT_DIR / type_dir / "best_fixed" / "model.zip")
     ):
         residual_candidates = [
-            str(CHECKPOINT_DIR / "residual" / "best_fixed" / "model.zip"),
-            str(CHECKPOINT_DIR / "residual" / "best" / "best_model.zip"),
+            str(CHECKPOINT_DIR / residual_dir / "best_fixed" / "model.zip"),
+            str(CHECKPOINT_DIR / residual_dir / "best" / "best_model.zip"),
         ]
         for path in residual_candidates:
             if os.path.exists(path):
@@ -333,12 +340,15 @@ def plan_sac(
         candidates.append(model_path)
     candidates.extend([
         # Selected by fixed-start success — the metric main.py cares about.
-        str(CHECKPOINT_DIR / "sac" / "best_fixed" / "model.zip"),
-        str(CHECKPOINT_DIR / "sac" / "best" / "best_model.zip"),
-        str(CHECKPOINT_DIR / "best" / "best_model.zip"),
-        str(CHECKPOINT_DIR / "sac" / "final.zip"),
-        str(CHECKPOINT_DIR / "sac_parking.zip"),
+        str(CHECKPOINT_DIR / type_dir / "best_fixed" / "model.zip"),
+        str(CHECKPOINT_DIR / type_dir / "best" / "best_model.zip"),
+        str(CHECKPOINT_DIR / type_dir / "final.zip"),
     ])
+    if pc.parking_type == "perpendicular":
+        candidates.extend([
+            str(CHECKPOINT_DIR / "best" / "best_model.zip"),
+            str(CHECKPOINT_DIR / "sac_parking.zip"),
+        ])
 
     start_t = time.perf_counter()
     model = None

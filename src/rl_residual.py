@@ -135,6 +135,13 @@ class ResidualParkingEnv(gym.Env):
     def grid(self):
         return self._inner.grid
 
+    def set_world(self, scene=None, obstacle=None) -> bool:
+        """Delegate world switching to the inner env and replan the base
+        reference for the new world."""
+        ok = self._inner.set_world(scene, obstacle)
+        self._plan_base_trajectory()
+        return ok
+
     def _plan_base_trajectory(self):
         """Gear-split, densified reference from the inner env's hybrid A*
         path (planned with body/steering margin — see rl_env)."""
@@ -145,6 +152,19 @@ class ResidualParkingEnv(gym.Env):
             wps = [Waypoint(x, y, th) for x, y, th in self._inner._ref_path]
             dense = _densify_for_tracking(wps, max_step=0.15)
             self._segments = split_by_gear(dense)
+            # Extend the final segment ~1 m beyond the goal along its
+            # heading (same fix as the demo collector): pure pursuit cannot
+            # finish straightening on a short last segment and otherwise
+            # stops tilted just outside the success window. The env
+            # terminates on success, so the extension is never fully driven.
+            if self._segments:
+                last_gear, last_seg = self._segments[-1]
+                ex, ey, eth = last_seg[-1].x, last_seg[-1].y, last_seg[-1].theta
+                direction = 1 if last_gear > 0 else -1
+                for k in range(1, 8):
+                    d = 0.15 * k * direction
+                    last_seg.append(Waypoint(
+                        ex + d * math.cos(eth), ey + d * math.sin(eth), eth))
         else:
             self._segments = []
         self._total_wps = sum(len(seg) for _, seg in self._segments) or 1
@@ -254,21 +274,31 @@ def train_residual(
     total_timesteps: int = 300_000,
     residual_scale: float = 0.15,
     seed: int = 0, verbose: int = 1, device: str = "auto",
+    # Stage 2 = base world only (fixed-start mix + path starts). Training
+    # the residual on randomized scenes (stage 3) drowns it in worlds the
+    # base controller cannot park, and the policy drifts off the good base
+    # before the first checkpoint.
+    stage: int = 2,
 ) -> SAC:
     if device == "auto":
         device = _default_device()
 
+    # Per-parking-type checkpoint/log namespaces ("residual" stays the
+    # perpendicular dir for backward compatibility).
+    algo_dir = ("residual" if pc.parking_type == "perpendicular"
+                else "residual_parallel")
+
     env = ResidualParkingEnv(
         parking_config=pc, car_config=cc,
         residual_scale=residual_scale, seed=seed,
-        curriculum_stage=3,
+        curriculum_stage=stage,
     )
     env = Monitor(env)
 
     eval_env = ResidualParkingEnv(
         parking_config=pc, car_config=cc,
         residual_scale=residual_scale, seed=seed + 1000,
-        curriculum_stage=3,
+        curriculum_stage=stage,
     )
 
     model = SAC(
@@ -290,7 +320,7 @@ def train_residual(
         verbose=verbose,
         seed=seed,
         device=device,
-        tensorboard_log=str(LOG_DIR / "residual" / "tensorboard"),
+        tensorboard_log=str(LOG_DIR / algo_dir / "tensorboard"),
         policy_kwargs=dict(net_arch=[256, 256]),
     )
 
@@ -300,13 +330,13 @@ def train_residual(
     model.policy.actor.mu.weight.data.zero_()
     model.policy.actor.mu.bias.data.zero_()
 
-    save_dir = str(CHECKPOINT_DIR / "residual" / "best")
+    save_dir = str(CHECKPOINT_DIR / algo_dir / "best")
     os.makedirs(save_dir, exist_ok=True)
 
     eval_cb = EvalCallback(
         Monitor(eval_env),
         best_model_save_path=save_dir,
-        log_path=str(LOG_DIR / "residual" / "eval"),
+        log_path=str(LOG_DIR / algo_dir / "eval"),
         eval_freq=10_000,
         n_eval_episodes=20,
         deterministic=True,
@@ -315,7 +345,7 @@ def train_residual(
     from rl_train import FixedStartEvalCallback
     fixed_cb = FixedStartEvalCallback(
         pc, cc,
-        save_path=str(CHECKPOINT_DIR / "residual" / "best_fixed" / "model"),
+        save_path=str(CHECKPOINT_DIR / algo_dir / "best_fixed" / "model"),
         eval_freq=10_000, n_episodes=10, verbose=verbose,
         env=ResidualParkingEnv(
             parking_config=pc, car_config=cc,
@@ -323,7 +353,7 @@ def train_residual(
         ),
     )
 
-    save_path = str(CHECKPOINT_DIR / "residual" / "final")
+    save_path = str(CHECKPOINT_DIR / algo_dir / "final")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     print(f"[Residual SAC] Training for {total_timesteps} steps on {device}...")

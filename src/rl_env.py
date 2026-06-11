@@ -476,6 +476,24 @@ class ParkingEnv(gym.Env):
         passes, so every training episode is parkable by construction.
         """
         if not stage.randomize_scene:
+            if stage.random_obstacle:
+                # Base scene with one random (feasible) obstacle: used by
+                # obstacle-focused fine-tuning. 30% rehearsal without it.
+                if self._rng.random() < 0.30:
+                    self._rebuild_world()
+                    return
+                base_scene = (self.pc.lane_width, self.pc.spot_length,
+                              self.pc.spot_width, self._base_cc.length,
+                              self._base_cc.width)
+                cands = obstacle_candidates(self.pc.parking_type, base_scene)
+                for _ in range(10):
+                    ob = cands[int(self._rng.integers(len(cands)))]
+                    key = (base_scene, ob)
+                    if key in self._dead_worlds:
+                        continue
+                    if self._rebuild_world(base_scene, ob):
+                        return
+                    self._dead_worlds.add(key)
             self._rebuild_world()
             return
 

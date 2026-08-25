@@ -1,6 +1,6 @@
 # Smart Parking Simulator
 
-A top-down 2D parking simulation built for the *Introduction to Smart Cars*
+A top-down 2D parking simulation built for the *Introduction to Intelligent Vehicles*
 course final project. Configure road and vehicle dimensions, pick a parking
 mode (perpendicular / parallel) and a planner (geometric MPC / Hybrid A* with
 Reeds-Shepp analytic shot / tabular Q-learning), then watch the car execute
